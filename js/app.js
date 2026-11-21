@@ -13,7 +13,7 @@ import {
   setSummaryPhrase,
 } from './coach.js';
 import { drawLegs } from './draw.js';
-import { PoseEngine } from './pose.js';
+import { IS_IOS, PoseEngine } from './pose.js';
 
 const WORK_MAX_SIDE = 960; // frames are analysed at this size (same as the Mac live mode)
 const BANNER_S = 4;
@@ -23,8 +23,11 @@ const TARGET_MIN = -25;
 const TARGET_MAX = 10;
 const SLOW_FPS = 8;
 const HISTORY_MAX = 20;
-const SETTINGS_KEY = 'squat-coach.settings';
+const SETTINGS_KEY = 'squat-coach.settings.v2'; // v2: fast model is the default on iPhone
 const HISTORY_KEY = 'squat-coach.history';
+const ALIVE_KEY = 'squat-coach.alive'; // heartbeat while the camera runs: still set on next load = the page died
+const ALIVE_EVERY_MS = 3000;
+const CRASH_WINDOW_MS = 10 * 60 * 1000;
 const GAUGE_TOP = 90;
 const GAUGE_BOTTOM = -30;
 
@@ -47,7 +50,8 @@ function writeJSON(key, value) {
   }
 }
 
-const settings = { target: -10, voice: true, facing: 'environment', fast: false, ...readJSON(SETTINGS_KEY, {}) };
+// iPhone: fast model by default (74 MB of memory vs 156 MB; iOS closes pages that use too much)
+const settings = { target: -10, voice: true, facing: 'environment', fast: IS_IOS, ...readJSON(SETTINGS_KEY, {}) };
 if (params.has('fast')) settings.fast = params.get('fast') === '1';
 const allowGpu = params.get('gpu') !== '0';
 const saveSettings = () => writeJSON(SETTINGS_KEY, settings);
@@ -213,6 +217,7 @@ async function openCamera(facing) {
     audio: false,
     video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
   });
+  stream.getVideoTracks()[0]?.addEventListener('ended', onCameraEnded);
   video.srcObject = stream;
   video.loop = false;
   await video.play();
@@ -234,6 +239,91 @@ function stopMedia() {
   stream = null;
   video.pause();
 }
+
+let lastCameraRetry = 0;
+
+/** iOS can cut the camera (memory, a call, another app using it): try to get it back once. */
+async function onCameraEnded() {
+  if (!live || live.source.kind !== 'camera' || document.visibilityState !== 'visible') return;
+  const now = performance.now();
+  if (now - lastCameraRetry < 5000) {
+    flash('La cámara se detuvo. Toca Terminar y vuelve a empezar.', 6);
+    return;
+  }
+  lastCameraRetry = now;
+  flash('La cámara se detuvo; reintentando…', 3);
+  try {
+    await openCamera(settings.facing);
+    scheduleNext();
+  } catch (err) {
+    flash(errorMessage(err), 6);
+  }
+}
+
+// ---------- crash detection and error reporting ----------
+let aliveTimer = null;
+
+function markAlive() {
+  try {
+    localStorage.setItem(ALIVE_KEY, String(Date.now()));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+function startAlive() {
+  markAlive();
+  clearInterval(aliveTimer);
+  aliveTimer = setInterval(markAlive, ALIVE_EVERY_MS);
+}
+
+function stopAlive() {
+  clearInterval(aliveTimer);
+  aliveTimer = null;
+  try {
+    localStorage.removeItem(ALIVE_KEY);
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** If the last session left its heartbeat behind, iOS closed the page (usually memory). Switch to the light model. */
+function checkPreviousCrash() {
+  let last = 0;
+  try {
+    last = Number(localStorage.getItem(ALIVE_KEY)) || 0;
+  } catch {
+    return;
+  }
+  stopAlive();
+  if (!last || Date.now() - last > CRASH_WINDOW_MS) return;
+  if (!settings.fast) {
+    settings.fast = true;
+    saveSettings();
+    setStatus(
+      'La app se cerró sola mientras usaba la cámara (el teléfono se quedó sin memoria). ' +
+        'Activé el Modo rápido, que usa la mitad de memoria. Toca Empezar otra vez.',
+    );
+  } else {
+    setStatus(
+      'La app se cerró sola otra vez mientras usaba la cámara. Cierra las otras apps abiertas ' +
+        '(sobre todo pestañas de Safari) y vuelve a intentar.',
+    );
+  }
+}
+
+let lastError = '';
+
+function reportError(msg) {
+  if (!msg || msg === lastError) return;
+  lastError = msg;
+  console.error(msg);
+  if (live) flash(`Error: ${msg}`, 5);
+  else setStatus(`Error: ${msg}`);
+}
+
+window.addEventListener('error', (e) => reportError(e.message));
+window.addEventListener('unhandledrejection', (e) => reportError(e.reason?.message || String(e.reason)));
 
 async function requestWakeLock() {
   try {
@@ -270,6 +360,7 @@ async function getEngine() {
 // ---------- live session ----------
 let live = null;
 let lastSource = null;
+let started = false; // the user tapped Empezar at least once: never auto-reload after this
 
 function newLive(source) {
   return {
@@ -290,8 +381,10 @@ function newLive(source) {
 
 async function start(source) {
   speaker.unlock(); // inside the tap, before any await
+  started = true;
   navigator.storage?.persist?.().catch(() => {});
   setStatus('');
+  startAlive(); // covers model loading too, the moment memory peaks
   try {
     const eng = await getEngine();
     showLoading(source.kind === 'camera' ? 'Abriendo la cámara…' : 'Abriendo el video…', 1);
@@ -309,6 +402,7 @@ async function start(source) {
     else scheduleNext();
   } catch (err) {
     console.error(err);
+    stopAlive();
     stopMedia();
     hideLoading();
     show('setup');
@@ -343,7 +437,7 @@ async function onFrame(_now, meta) {
   try {
     if (video.readyState >= 2 && video.videoWidth) await processFrame(meta);
   } catch (err) {
-    console.error(err);
+    reportError(err?.message || String(err));
   }
   scheduleNext();
 }
@@ -494,7 +588,12 @@ video.addEventListener('ended', () => {
 });
 
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState !== 'visible' || !live) return;
+  if (document.visibilityState !== 'visible') {
+    stopAlive(); // leaving the app on purpose is not a crash
+    return;
+  }
+  if (!live) return;
+  startAlive();
   requestWakeLock();
   const track = stream?.getVideoTracks()[0];
   if (live.source.kind === 'camera' && (!track || track.readyState === 'ended' || video.paused)) {
@@ -512,6 +611,7 @@ function finish() {
   if (!st) return;
   st.running = false;
   live = null;
+  stopAlive();
   stopMedia();
   releaseWakeLock();
   if ('speechSynthesis' in window && !st.counter.reps.length) speechSynthesis.cancel();
@@ -631,7 +731,7 @@ async function registerServiceWorker() {
   // The worker adds the headers that unlock multithreading only once it controls the page: reload once.
   if (self.crossOriginIsolated) return;
   const reloadOnce = () => {
-    if (live || sessionStorage.getItem('coi-reload')) return;
+    if (started || live || sessionStorage.getItem('coi-reload')) return; // never reload under the user's feet
     sessionStorage.setItem('coi-reload', '1');
     location.reload();
   };
@@ -639,9 +739,10 @@ async function registerServiceWorker() {
   else navigator.serviceWorker.addEventListener('controllerchange', reloadOnce, { once: true });
 }
 
-const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-$('installHint').hidden = !(isIOS && !navigator.standalone);
+$('installHint').hidden = !(IS_IOS && !navigator.standalone);
+window.addEventListener('pagehide', stopAlive);
 
+checkPreviousCrash();
 renderSettings();
 renderHistory();
 show('setup');

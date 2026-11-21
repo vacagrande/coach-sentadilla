@@ -26,6 +26,12 @@ const BOX_PAD = 0.2;
 const MIN_IOU = 0.3;
 const SWITCH_RATIO = 1.5; // only jump to another person if they are clearly bigger
 
+export const IS_IOS =
+  /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const IS_SAFARI = /^((?!chrome|crios|fxios|android).)*safari/i.test(navigator.userAgent);
+// ONNX Runtime does not support WebGPU on Safari/iOS, and testing it there loads the model twice (memory).
+const GPU_SUPPORTED = !IS_IOS && !IS_SAFARI;
+
 ort.env.wasm.wasmPaths = new URL('vendor/ort/', ROOT).href;
 ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
 ort.env.logLevel = 'error';
@@ -143,7 +149,7 @@ function sameKeypoints(a, b) {
  */
 async function createPoseSession(bytes, allowGpu) {
   const cpu = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] });
-  if (!allowGpu || !navigator.gpu) return { session: cpu, backend: 'CPU' };
+  if (!allowGpu || !GPU_SUPPORTED || !navigator.gpu) return { session: cpu, backend: 'CPU' };
   let gpu = null;
   try {
     const feeds = { [cpu.inputNames[0]]: testInput() };
