@@ -35,9 +35,12 @@ export function innerAngle(a, b, c) {
   return deg(Math.acos(Math.max(-1, Math.min(1, cos))));
 }
 
-const EMA_ALPHA = 0.55; // 1 = no smoothing; lower = smoother but laggier
+// Smoothing is time based, so a phone that analyses 10 frames/s does not lag 3x more than one doing 30:
+// weight of a new sample = 1 - exp(-dt / SMOOTH_TAU_S), which is 0.55 at 30 analyses per second.
+const SMOOTH_TAU_S = 0.0417;
+const DEFAULT_DT_S = 1 / 30;
+const HOLD_S = 0.35; // keep the last skeleton this long when the pose drops out
 const SIDE_HYSTERESIS = 0.1;
-const MAX_MISSED = 10; // frames we keep the last skeleton when the pose drops out
 const LENGTH_HISTORY = 90;
 const LENGTH_MIN_SAMPLES = 15;
 
@@ -53,18 +56,22 @@ export class JointFilter {
     this.xy = null;
     this.side = 1;
     this.lengths = cfg.lengthPairs.map(() => []);
-    this.missed = 0;
+    this.seenT = null; // time of the last accepted sample
+    this.clock = 0; // fallback clock when the caller passes no time
   }
 
-  miss() {
-    this.missed += 1;
-    if (this.missed > MAX_MISSED) this.xy = null;
+  miss(t) {
+    if (this.seenT === null || t - this.seenT > HOLD_S) this.xy = null;
     return this.xy;
   }
 
-  /** found = { kps: Float32Array(17*2), scores: Float32Array(17) } or null. Returns {joint: [x, y]} or null. */
-  update(found) {
-    if (!found) return this.miss();
+  /**
+   * found = { kps: Float32Array(17*2), scores: Float32Array(17) } or null; t = time of the frame in seconds.
+   * Returns {joint: [x, y]} or null.
+   */
+  update(found, t) {
+    if (t === undefined) t = this.clock += DEFAULT_DT_S;
+    if (!found) return this.miss(t);
     const { kps, scores } = found;
     const { kp, sideJoints, lengthPairs, lengthTol } = this.cfg;
     const conf = [0, 1].map((side) => sideJoints.reduce((acc, n) => acc + scores[kp[n][side]], 0) / sideJoints.length);
@@ -79,21 +86,23 @@ export class JointFilter {
       (len, i) =>
         this.lengths[i].length >= LENGTH_MIN_SAMPLES && Math.abs(len / median(this.lengths[i]) - 1) > lengthTol,
     );
-    if (bad) return this.miss(); // implausible limb length: the model put a joint in the wrong place
+    if (bad) return this.miss(t); // implausible limb length: the model put a joint in the wrong place
     lens.forEach((len, i) => {
       this.lengths[i].push(len);
       if (this.lengths[i].length > LENGTH_HISTORY) this.lengths[i].shift();
     });
-    this.missed = 0;
     if (!this.xy) {
       this.xy = pts;
     } else {
+      const dt = Math.max(1 / 120, Math.min(0.5, t - this.seenT));
+      const a = 1 - Math.exp(-dt / SMOOTH_TAU_S);
       for (const name of this.joints) {
         const [x, y] = pts[name];
         const [px, py] = this.xy[name];
-        this.xy[name] = [EMA_ALPHA * x + (1 - EMA_ALPHA) * px, EMA_ALPHA * y + (1 - EMA_ALPHA) * py];
+        this.xy[name] = [a * x + (1 - a) * px, a * y + (1 - a) * py];
       }
     }
+    this.seenT = t;
     return this.xy;
   }
 }

@@ -1,6 +1,6 @@
 // Service worker: works offline after the first visit, and adds the COOP/COEP headers
 // that let ONNX Runtime use several CPU threads (static hosts like GitHub Pages can't set them).
-const VERSION = 'v4';
+const VERSION = 'v5';
 const SHELL_CACHE = `shell-${VERSION}`;
 const BIG_CACHE = 'big-v1'; // models + wasm: large, change rarely, kept across app updates
 const SHELL = [
@@ -63,8 +63,10 @@ async function cacheFirst(req) {
 async function networkFirst(req) {
   const cache = await caches.open(SHELL_CACHE);
   try {
+    // 'no-cache' = always ask the server whether the file changed (the host lets browsers reuse a copy
+    // for 10 minutes, which delayed updates); unchanged files cost a tiny "not modified" reply.
     const res = await Promise.race([
-      fetch(req),
+      fetch(req, { cache: 'no-cache' }).catch(() => fetch(req)),
       new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), NETWORK_TIMEOUT_MS)),
     ]);
     if (res.ok) await cache.put(req, res.clone());

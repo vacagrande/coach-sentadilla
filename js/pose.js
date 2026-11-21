@@ -18,7 +18,8 @@ const STD = [58.395, 57.12, 57.375];
 const SIMCC_SPLIT = 2;
 const BBOX_PADDING = 1.25;
 
-const DET_EVERY = 15; // re-check who the lifter is this often (frames); follow their box in between
+const DET_EVERY_S = 1.0; // re-check who the lifter is this often; follow their box in between
+const DET_RETRY_S = 0.25; // nobody tracked yet: how often to run the detector while looking for a person
 const DET_SCORE = 0.2; // YOLOX-nano scores a lifter half hidden by the plate at only 0.3-0.4
 const MIN_KPT_SCORE = 0.3;
 const MIN_GOOD_KPTS = 6;
@@ -36,8 +37,10 @@ ort.env.wasm.wasmPaths = new URL('vendor/ort/', ROOT).href;
 ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.min(4, navigator.hardwareConcurrency || 1) : 1;
 ort.env.logLevel = 'error';
 
+// Small CPU canvases the model input is read from. The video is cropped straight into them, so only
+// these few pixels are copied out of the GPU per frame (never the whole camera frame).
 function makeCanvas(w, h) {
-  const c = typeof OffscreenCanvas !== 'undefined' ? new OffscreenCanvas(w, h) : document.createElement('canvas');
+  const c = document.createElement('canvas');
   c.width = w;
   c.height = h;
   const ctx = c.getContext('2d', { willReadFrequently: true });
@@ -148,13 +151,15 @@ function sameKeypoints(a, b) {
  * ONNX Runtime does not officially support WebGPU on Safari, so this checks instead of trusting it.
  */
 async function createPoseSession(bytes, allowGpu) {
-  const cpu = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'] });
+  // The model is exported with a free batch size; fixing it to 1 lets the runtime plan memory once.
+  const fixed = { freeDimensionOverrides: { batch: 1 } };
+  const cpu = await ort.InferenceSession.create(bytes, { executionProviders: ['wasm'], ...fixed });
   if (!allowGpu || !GPU_SUPPORTED || !navigator.gpu) return { session: cpu, backend: 'CPU' };
   let gpu = null;
   try {
     const feeds = { [cpu.inputNames[0]]: testInput() };
     const ref = await timeRuns(cpu, feeds, 3);
-    gpu = await ort.InferenceSession.create(bytes, { executionProviders: ['webgpu'] });
+    gpu = await ort.InferenceSession.create(bytes, { executionProviders: ['webgpu'], ...fixed });
     const test = await timeRuns(gpu, feeds, 3);
     if (sameKeypoints(ref.out, test.out) && test.ms < ref.ms * 0.8) {
       await cpu.release();
@@ -191,7 +196,7 @@ export class PoseEngine {
     this.variant = variant;
     this.threads = ort.env.wasm.numThreads;
     this.box = null;
-    this.frame = 0;
+    this.lastDetT = -Infinity;
     this.detCanvas = makeCanvas(DET_SIZE, DET_SIZE);
     this.poseCanvas = makeCanvas(POSE_W, POSE_H);
     this.detBuf = new Float32Array(3 * DET_SIZE * DET_SIZE);
@@ -201,7 +206,7 @@ export class PoseEngine {
 
   reset() {
     this.box = null;
-    this.frame = 0;
+    this.lastDetT = -Infinity;
   }
 
   async detect(src, w, h) {
@@ -290,15 +295,19 @@ export class PoseEngine {
     return { kps, scores };
   }
 
-  /** Find and follow the lifter in `src` (a canvas w x h). Returns { kps, scores } or null. */
-  async process(src, w, h) {
+  /**
+   * Find and follow the lifter in `src` (the video element, or a canvas; w x h = its pixel size).
+   * t = time of this frame in seconds. Returns { kps, scores } in src pixels, or null.
+   */
+  async process(src, w, h, t) {
     let box = this.box;
     this.timing.det = 0;
-    if (!box || this.frame % DET_EVERY === 0) {
+    const wait = box ? DET_EVERY_S : DET_RETRY_S;
+    if (t - this.lastDetT >= wait || t < this.lastDetT) {
+      this.lastDetT = t;
       const boxes = await this.detect(src, w, h);
       box = boxes.length ? this.pick(boxes) : this.box;
     }
-    this.frame += 1;
     // Detector missed and nobody is tracked: try the whole frame (the lifter usually fills it);
     // the keypoint check below rejects it if there is nobody there.
     if (!box) box = [0, 0, w, h];

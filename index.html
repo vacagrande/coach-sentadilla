@@ -91,12 +91,12 @@
     <div class="spinner" aria-hidden="true"></div>
     <p id="loadMsg">Preparando…</p>
     <progress id="loadBar" max="1" value="0"></progress>
-    <p class="hint">La primera vez descarga ~85 MB (usa Wi-Fi); después funciona sin internet.</p>
+    <p class="hint">La primera vez descarga el modelo (55–85 MB, usa Wi-Fi); después funciona sin internet.</p>
   </div>
 
   <!-- En vivo -->
   <main id="live" class="screen live" hidden>
-    <video id="video" playsinline muted autoplay></video>
+    <video id="video" playsinline muted autoplay disablepictureinpicture></video>
     <canvas id="canvas"></canvas>
 
     <div class="hud">

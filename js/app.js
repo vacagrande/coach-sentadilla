@@ -3,7 +3,12 @@
 import { DEFAULT_EXERCISE, EXERCISES } from './exercises.js';
 import { IS_IOS, PoseEngine } from './pose.js';
 
-const WORK_MAX_SIDE = 960; // frames are analysed at this size (same as the Mac live mode)
+// The camera is shown by the <video> itself at its native frame rate. The model analyses frames as fast as
+// the phone allows, and a transparent canvas on top draws the skeleton, eased between analyses.
+const OVERLAY_TAU_MS = 45; // how quickly the drawn lines catch up with the latest analysis
+const OVERLAY_MAX_SIDE = 2560; // cap for the overlay's pixel size
+const OVERLAY_SETTLED_PX = 0.25; // stop repainting once the lines are this close to their target
+const STALL_MS = 2500; // camera delivering no frames for this long: restart it
 const BANNER_S = 4;
 const HIT_FLASH_S = 1;
 const SET_REST_S = 8; // this long without reps closes the set and speaks a summary
@@ -143,6 +148,7 @@ function showLoading(msg, fraction) {
 
 const hideLoading = () => {
   $('loading').hidden = true;
+  $('loading').classList.remove('over-camera');
 };
 
 const setStatus = (msg) => {
@@ -214,12 +220,15 @@ $('file').onchange = (e) => {
 
 // ---------- media ----------
 const video = $('video');
-const canvas = $('canvas');
+const canvas = $('canvas'); // transparent overlay on top of the video
 const ctx = canvas.getContext('2d');
-const work = document.createElement('canvas');
-const wctx = work.getContext('2d', { willReadFrequently: true });
 let stream = null;
 let wakeLock = null;
+
+function setMirror(on) {
+  video.classList.toggle('mirror', on);
+  canvas.classList.toggle('mirror', on);
+}
 
 async function openCamera(facing) {
   stopMedia();
@@ -232,7 +241,7 @@ async function openCamera(facing) {
   video.srcObject = stream;
   video.loop = false;
   await video.play();
-  canvas.classList.toggle('mirror', facing === 'user');
+  setMirror(facing === 'user');
 }
 
 async function openFile(url) {
@@ -242,7 +251,7 @@ async function openFile(url) {
   video.loop = false;
   video.currentTime = 0;
   await video.play();
-  canvas.classList.remove('mirror');
+  setMirror(false);
 }
 
 function stopMedia() {
@@ -265,7 +274,7 @@ async function onCameraEnded() {
   flash('La cámara se detuvo; reintentando…', 3);
   try {
     await openCamera(settings.facing);
-    scheduleNext();
+    startLoop();
   } catch (err) {
     flash(errorMessage(err), 6);
   }
@@ -387,8 +396,13 @@ function newLive(source) {
     setReps: [],
     t0: performance.now(),
     fps: 0,
-    lastPaint: 0,
+    lastAnalysis: 0,
+    lastFrameAt: performance.now(),
     startedAt: performance.now(),
+    pose: null, // latest analysed joints (video pixels); the overlay eases toward them
+    drawn: null, // joints as currently drawn
+    lastDraw: 0,
+    overlayKey: '',
   };
 }
 
@@ -398,21 +412,30 @@ async function start(source) {
   navigator.storage?.persist?.().catch(() => {});
   setStatus('');
   startAlive(); // covers model loading too, the moment memory peaks
+  const stepping = source.kind === 'file' && params.get('step') === '1';
   try {
-    const eng = await getEngine();
-    showLoading(source.kind === 'camera' ? 'Abriendo la cámara…' : 'Abriendo el video…', 1);
+    // Camera first: the permission prompt comes right after the tap and the image is already
+    // on screen (behind the progress bar) while the model loads.
+    showLoading(source.kind === 'camera' ? 'Abriendo la cámara…' : 'Abriendo el video…', 0);
     if (source.kind === 'camera') await openCamera(settings.facing);
     else await openFile(source.url);
+    if (source.kind === 'file') video.pause(); // a clip waits on its first frame until the model is ready
+    resetHud(currentEx());
+    clearOverlay();
+    show('live');
+    $('loading').classList.add('over-camera');
+    const eng = await getEngine();
     eng.reset();
+    if (source.kind === 'file' && !stepping) await video.play();
     lastSource = source;
     live = newLive(source);
     hideLoading();
-    show('live');
     renderControls();
     requestWakeLock();
     speaker.say(live.ex.ready);
-    if (source.kind === 'file' && params.get('step') === '1') stepThrough();
-    else scheduleNext();
+    startOverlay();
+    if (stepping) stepThrough();
+    else startLoop();
   } catch (err) {
     console.error(err);
     stopAlive();
@@ -439,40 +462,72 @@ async function stepThrough(fps = 30) {
   if (live === st) finish();
 }
 
-function scheduleNext() {
-  if (!live?.running) return;
-  if (typeof video.requestVideoFrameCallback === 'function') video.requestVideoFrameCallback(onFrame);
-  else requestAnimationFrame(() => onFrame(performance.now(), null));
+// ---------- analysis loop: one model run per new camera frame, as fast as the phone allows ----------
+let loopGen = 0;
+let analysing = false;
+
+// Test hook (?loop=poll[&slow=ms]): browsers deliver frame callbacks only once per second while a page is
+// off screen, which is how automated tests run. This drives the loop by watching the video clock instead,
+// and `slow` adds a pause per analysis to imitate a slower phone.
+const POLL_TEST = params.get('loop') === 'poll';
+const SLOW_TEST_MS = Number(params.get('slow')) || 0;
+const pollChannel = POLL_TEST ? new MessageChannel() : null;
+let pollLastT = -1;
+
+function pollFrame(cb) {
+  const notBefore = performance.now() + SLOW_TEST_MS;
+  pollChannel.port1.onmessage = () => {
+    if (performance.now() >= notBefore && video.currentTime !== pollLastT) {
+      pollLastT = video.currentTime;
+      cb(performance.now(), { mediaTime: video.currentTime });
+    } else if (live?.running) {
+      pollChannel.port2.postMessage(0);
+    }
+  };
+  pollChannel.port2.postMessage(0);
 }
 
-async function onFrame(_now, meta) {
-  if (!live?.running) return;
-  try {
-    if (video.readyState >= 2 && video.videoWidth) await processFrame(meta);
-  } catch (err) {
-    reportError(err?.message || String(err));
-  }
-  scheduleNext();
+function requestFrame(cb) {
+  if (POLL_TEST) pollFrame(cb);
+  else if (typeof video.requestVideoFrameCallback === 'function') video.requestVideoFrameCallback(cb);
+  else requestAnimationFrame((now) => cb(now, null));
+}
+
+/**
+ * (Re)start the analysis loop. Any loop started earlier stops at its next callback, so reopening the
+ * camera (switch, return from background) can never leave two loops fighting over the model.
+ */
+function startLoop() {
+  const gen = ++loopGen;
+  const tick = async (_now, meta) => {
+    if (gen !== loopGen || !live?.running) return;
+    if (!analysing && video.readyState >= 2 && video.videoWidth) {
+      analysing = true;
+      try {
+        await processFrame(meta);
+      } catch (err) {
+        reportError(err?.message || String(err));
+      } finally {
+        analysing = false;
+      }
+    }
+    if (gen === loopGen && live?.running) requestFrame(tick);
+  };
+  requestFrame(tick);
 }
 
 async function processFrame(meta) {
   const st = live;
   const ex = st.ex;
   const target = targetFor(ex);
-  const k = Math.min(1, WORK_MAX_SIDE / Math.max(video.videoWidth, video.videoHeight));
-  const w = Math.round((video.videoWidth * k) / 2) * 2;
-  const h = Math.round((video.videoHeight * k) / 2) * 2;
-  if (work.width !== w || work.height !== h) {
-    work.width = canvas.width = w;
-    work.height = canvas.height = h;
-  }
-  wctx.drawImage(video, 0, 0, w, h);
   const t = st.source.kind === 'file' ? (meta?.mediaTime ?? video.currentTime) : (performance.now() - st.t0) / 1000;
 
-  const found = await engine.process(work, w, h);
+  // the model crops what it needs straight from the video (joints come back in video pixels)
+  const found = await engine.process(video, video.videoWidth, video.videoHeight, t);
   if (live !== st) return; // session ended while the model was running
+  st.lastFrameAt = performance.now();
 
-  const xy = st.filter.update(found);
+  const xy = st.filter.update(found, t);
   const value = xy ? ex.value(xy) : null;
   if (xy) for (const ev of st.counter.update(t, xy)) onEvent(st, ev, t);
   if (st.setReps.length && !st.counter.inRep && t - st.lastRepT > SET_REST_S) {
@@ -481,13 +536,107 @@ async function processFrame(meta) {
     st.banner = { text: p.text, color: 'white', until: t + BANNER_S * 2 };
     st.setReps = [];
   }
-
-  // paint the analysed frame and its overlay in one go (no flicker, overlay matches the frame)
-  ctx.drawImage(work, 0, 0);
-  if (xy) ex.draw(ctx, xy, target, st.counter.inRep, Math.min(w, h) / 720);
+  st.pose = xy;
   renderHud(st, t, value, xy);
   renderFps(st);
 }
+
+// ---------- overlay loop: redraws the skeleton on every screen refresh, eased toward the latest analysis ----------
+let overlayGen = 0;
+let overlayDirty = true; // the canvas needs re-fitting (rotation, resize, new video size)
+let overlayFor = '';
+
+function clearOverlay() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+}
+
+/** Size the canvas to the pixels the video really covers on screen, so the lines are sharp. */
+function fitOverlay(vw, vh) {
+  const box = canvas.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  let k = box.width && box.height ? Math.min(box.width / vw, box.height / vh) * dpr : 1;
+  k = Math.min(k, OVERLAY_MAX_SIDE / Math.max(vw, vh));
+  const cw = Math.max(2, Math.round(vw * k));
+  const ch = Math.max(2, Math.round(vh * k));
+  if (canvas.width !== cw || canvas.height !== ch) {
+    canvas.width = cw;
+    canvas.height = ch;
+  }
+  overlayFor = `${vw}x${vh}`;
+  overlayDirty = false;
+}
+
+function drawOverlay(st, now) {
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return;
+  let repaint = false;
+  if (overlayDirty || overlayFor !== `${vw}x${vh}`) {
+    fitOverlay(vw, vh);
+    repaint = true;
+  }
+  const pose = st.pose;
+  if (!pose) {
+    if (st.drawn || repaint) clearOverlay();
+    st.drawn = null;
+    st.lastDraw = now;
+    return;
+  }
+  const a = st.drawn ? 1 - Math.exp(-(now - st.lastDraw) / OVERLAY_TAU_MS) : 1;
+  st.lastDraw = now;
+  st.drawn ??= {};
+  let moved = 0;
+  for (const name in pose) {
+    const p = pose[name];
+    const d = st.drawn[name] || p;
+    const x = d[0] + (p[0] - d[0]) * a;
+    const y = d[1] + (p[1] - d[1]) * a;
+    moved = Math.max(moved, Math.abs(p[0] - d[0]), Math.abs(p[1] - d[1]));
+    st.drawn[name] = [x, y];
+  }
+  const target = targetFor(st.ex);
+  const key = `${st.counter.inRep}|${target}`;
+  const k = canvas.width / vw;
+  if (!repaint && key === st.overlayKey && moved * k < OVERLAY_SETTLED_PX) return; // nothing visibly changed
+  st.overlayKey = key;
+  clearOverlay();
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  st.ex.draw(ctx, st.drawn, target, st.counter.inRep, Math.min(vw, vh) / 720);
+}
+
+function startOverlay() {
+  const gen = ++overlayGen;
+  const frame = (now) => {
+    const st = live;
+    if (gen !== overlayGen || !st?.running) return;
+    drawOverlay(st, now);
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+
+const markOverlayDirty = () => {
+  overlayDirty = true;
+};
+window.addEventListener('resize', markOverlayDirty);
+window.addEventListener('orientationchange', markOverlayDirty);
+video.addEventListener('resize', markOverlayDirty);
+
+// Watchdog: if the camera stops delivering frames (iOS pauses it now and then), wake it up.
+setInterval(() => {
+  const st = live;
+  if (!st?.running || st.source.kind !== 'camera' || document.visibilityState !== 'visible') return;
+  if (analysing || performance.now() - st.lastFrameAt < STALL_MS) return;
+  st.lastFrameAt = performance.now();
+  const track = stream?.getVideoTracks()[0];
+  if (!track || track.readyState === 'ended') {
+    onCameraEnded();
+    return;
+  }
+  video.play().catch(() => {});
+  startLoop();
+}, 1000);
 
 function onEvent(st, ev, t) {
   if (ev.kind === 'depth') {
@@ -508,54 +657,94 @@ function gaugeY(ex, v) {
   return `${((top - c) / (top - bottom)) * 100}%`;
 }
 
+// The HUD is refreshed on every analysis: look the elements up once and only touch what changed.
+const el = Object.fromEntries(
+  [
+    'repCount',
+    'metricName',
+    'you',
+    'youLabel',
+    'targetText',
+    'targetLabel',
+    'banner',
+    'gZone',
+    'gParallel',
+    'gTarget',
+    'gMin',
+    'gDot',
+    'fps',
+  ].map((id) => [id, $(id)]),
+);
+
+function setTop(node, top) {
+  if (node.dataset.top !== top) {
+    node.dataset.top = top;
+    node.style.top = top;
+  }
+}
+
+function setHidden(node, hidden) {
+  if (node.hidden !== hidden) node.hidden = hidden;
+}
+
+function resetHud(ex) {
+  const target = targetFor(ex);
+  setText(el.repCount, 'Rep 0');
+  setText(el.metricName, ex.metric);
+  setText(el.you, 'Tú —');
+  setText(el.youLabel, '');
+  setText(el.targetText, `Objetivo ${ex.fmt(target)}`);
+  setText(el.targetLabel, ex.positionLabel(target, target));
+  setText(el.fps, '');
+  for (const node of [el.banner, el.gMin, el.gDot]) setHidden(node, true);
+}
+
 function renderHud(st, t, value, xy) {
   const ex = st.ex;
   const target = targetFor(ex);
-  setText($('repCount'), `Rep ${st.counter.reps.length}`);
-  setText($('metricName'), ex.metric);
-  setText($('you'), value == null ? 'Tú —' : `Tú ${ex.fmt(value)}`);
-  setText($('youLabel'), value == null ? '' : ex.positionLabel(value, target));
-  setText($('targetText'), `Objetivo ${ex.fmt(target)}`);
-  setText($('targetLabel'), ex.positionLabel(target, target));
+  setText(el.repCount, `Rep ${st.counter.reps.length}`);
+  setText(el.metricName, ex.metric);
+  setText(el.you, value == null ? 'Tú —' : `Tú ${ex.fmt(value)}`);
+  setText(el.youLabel, value == null ? '' : ex.positionLabel(value, target));
+  setText(el.targetText, `Objetivo ${ex.fmt(target)}`);
+  setText(el.targetLabel, ex.positionLabel(target, target));
 
   let note = null;
   if (t < st.hitFlashUntil) note = { text: ex.hit, color: 'green' };
   else if (st.banner && t < st.banner.until) note = st.banner;
   else if (!xy) note = { text: ex.lost, color: 'orange' };
-  const banner = $('banner');
-  banner.hidden = !note;
+  setHidden(el.banner, !note);
   if (note) {
-    setText(banner, note.text);
-    banner.dataset.color = note.color;
+    setText(el.banner, note.text);
+    if (el.banner.dataset.color !== note.color) el.banner.dataset.color = note.color;
   }
 
   const zone = target + ex.tol;
-  $('gZone').style.top = gaugeY(ex, zone);
-  $('gParallel').style.top = gaugeY(ex, ex.gauge.ref);
-  $('gTarget').style.top = gaugeY(ex, target);
-  const min = $('gMin');
-  min.hidden = !st.counter.inRep;
-  if (st.counter.inRep) min.style.top = gaugeY(ex, st.counter.peak);
-  const dot = $('gDot');
-  dot.hidden = value == null;
+  setTop(el.gZone, gaugeY(ex, zone));
+  setTop(el.gParallel, gaugeY(ex, ex.gauge.ref));
+  setTop(el.gTarget, gaugeY(ex, target));
+  setHidden(el.gMin, !st.counter.inRep);
+  if (st.counter.inRep) setTop(el.gMin, gaugeY(ex, st.counter.peak));
+  setHidden(el.gDot, value == null);
   if (value != null) {
-    dot.style.top = gaugeY(ex, value);
-    dot.classList.toggle('hit', value <= zone);
+    setTop(el.gDot, gaugeY(ex, value));
+    el.gDot.classList.toggle('hit', value <= zone);
   }
 }
 
+/** Bottom line: how many analyses per second the model manages (the camera image itself runs at its own rate). */
 function renderFps(st) {
   const now = performance.now();
-  if (st.lastPaint) {
-    const inst = 1000 / Math.max(now - st.lastPaint, 1);
+  if (st.lastAnalysis) {
+    const inst = 1000 / Math.max(now - st.lastAnalysis, 1);
     st.fps = st.fps ? 0.9 * st.fps + 0.1 * inst : inst;
   }
-  st.lastPaint = now;
+  st.lastAnalysis = now;
   const slow = st.fps < SLOW_FPS && now - st.startedAt > 4000 && engine.variant !== 'fast';
   const threads = engine.threads > 1 ? ` ×${engine.threads}` : '';
-  const text = `${st.fps.toFixed(0)} fps · ${engine.backend}${threads} · ${engine.variant === 'fast' ? 'rápido' : 'preciso'}`;
-  setText($('fps'), slow ? `${text} · va lento: activa Modo rápido en Inicio` : text);
-  $('fps').classList.toggle('slow', slow);
+  const text = `${st.fps.toFixed(0)} análisis/s · ${engine.backend}${threads} · ${engine.variant === 'fast' ? 'rápido' : 'preciso'}`;
+  setText(el.fps, slow ? `${text} · va lento: activa Modo rápido en Inicio` : text);
+  el.fps.classList.toggle('slow', slow);
 }
 
 function renderControls() {
@@ -587,16 +776,22 @@ $('cCam').onclick = async () => {
   try {
     await openCamera(settings.facing);
     live.filter = live.ex.makeFilter();
+    live.pose = null;
     engine.reset();
     flash(settings.facing === 'user' ? 'Cámara frontal' : 'Cámara trasera');
-    scheduleNext();
+    startLoop();
   } catch (err) {
     flash(errorMessage(err), 4);
   }
 };
 $('cReset').onclick = () => {
   if (!live) return;
-  Object.assign(live, { filter: live.ex.makeFilter(), counter: live.ex.makeCounter(targetFor(live.ex)), setReps: [] });
+  Object.assign(live, {
+    filter: live.ex.makeFilter(),
+    counter: live.ex.makeCounter(targetFor(live.ex)),
+    setReps: [],
+    pose: null,
+  });
   engine.reset();
   flash('Conteo reiniciado');
 };
@@ -613,15 +808,18 @@ document.addEventListener('visibilitychange', async () => {
   if (!live) return;
   startAlive();
   requestWakeLock();
+  markOverlayDirty();
+  live.lastFrameAt = performance.now();
   const track = stream?.getVideoTracks()[0];
   if (live.source.kind === 'camera' && (!track || track.readyState === 'ended' || video.paused)) {
     try {
       await openCamera(settings.facing); // iOS stops the camera when the app goes to the background
-      scheduleNext();
+      startLoop();
     } catch (err) {
       flash(errorMessage(err), 4);
     }
   }
+  if (live) startOverlay();
 });
 
 function finish() {
@@ -629,6 +827,9 @@ function finish() {
   if (!st) return;
   st.running = false;
   live = null;
+  loopGen += 1; // stop the analysis and overlay loops
+  overlayGen += 1;
+  clearOverlay();
   stopAlive();
   stopMedia();
   releaseWakeLock();
@@ -644,8 +845,10 @@ const fmtWhen = (d) =>
   d.toLocaleString('es', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
 
 let summaryText = '';
+let summaryEx = null; // exercise of the summary on screen: "Otra serie" repeats that one
 
 function showSummary(ex, reps, target, when) {
+  summaryEx = ex.id;
   $('sumTitle').textContent = `${ex.name} · ${fmtWhen(when)}`;
   const stat = (label, value) => `<div class="stat"><span>${label}</span><b>${value}</b></div>`;
   $('sumStats').innerHTML = reps.length
@@ -727,7 +930,14 @@ function renderHistory() {
   );
 }
 
-$('again').onclick = () => start(lastSource?.kind === 'file' ? lastSource : { kind: 'camera' });
+$('again').onclick = () => {
+  if (EXERCISES[summaryEx] && summaryEx !== settings.exercise) {
+    settings.exercise = summaryEx;
+    saveSettings();
+    renderSettings();
+  }
+  start(lastSource?.kind === 'file' ? lastSource : { kind: 'camera' });
+};
 $('home').onclick = () => {
   renderHistory();
   show('setup');
