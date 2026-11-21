@@ -1,35 +1,19 @@
-// Coach de Sentadilla (web): camera -> pose -> leg overlay, depth beep and spoken feedback.
-import {
-  DEPTH_TOL,
-  LegFilter,
-  RepCounter,
-  VERDICT_TEXT,
-  angles,
-  depthVerdict,
-  fmtDeg,
-  positionLabel,
-  repFeedback,
-  sessionNotes,
-  setSummaryPhrase,
-} from './coach.js';
-import { drawLegs } from './draw.js';
+// Coach de Gym (web): camera -> pose -> overlay, beep at the target and spoken feedback per rep.
+// Exercise-specific logic lives in squat.js / curl.js (see exercises.js).
+import { DEFAULT_EXERCISE, EXERCISES } from './exercises.js';
 import { IS_IOS, PoseEngine } from './pose.js';
 
 const WORK_MAX_SIDE = 960; // frames are analysed at this size (same as the Mac live mode)
 const BANNER_S = 4;
-const DEPTH_FLASH_S = 1;
+const HIT_FLASH_S = 1;
 const SET_REST_S = 8; // this long without reps closes the set and speaks a summary
-const TARGET_MIN = -25;
-const TARGET_MAX = 10;
 const SLOW_FPS = 8;
-const HISTORY_MAX = 20;
+const HISTORY_MAX = 30;
 const SETTINGS_KEY = 'squat-coach.settings.v2'; // v2: fast model is the default on iPhone
 const HISTORY_KEY = 'squat-coach.history';
 const ALIVE_KEY = 'squat-coach.alive'; // heartbeat while the camera runs: still set on next load = the page died
 const ALIVE_EVERY_MS = 3000;
 const CRASH_WINDOW_MS = 10 * 60 * 1000;
-const GAUGE_TOP = 90;
-const GAUGE_BOTTOM = -30;
 
 const $ = (id) => document.getElementById(id);
 const params = new URLSearchParams(location.search);
@@ -51,10 +35,19 @@ function writeJSON(key, value) {
 }
 
 // iPhone: fast model by default (74 MB of memory vs 156 MB; iOS closes pages that use too much)
-const settings = { target: -10, voice: true, facing: 'environment', fast: IS_IOS, ...readJSON(SETTINGS_KEY, {}) };
+const stored = readJSON(SETTINGS_KEY, {});
+const settings = { exercise: DEFAULT_EXERCISE, voice: true, facing: 'environment', fast: IS_IOS, ...stored };
+settings.targets = { ...(stored.targets || {}) };
+if (stored.target !== undefined && settings.targets.squat === undefined) settings.targets.squat = stored.target; // old format
+delete settings.target;
+if (!EXERCISES[settings.exercise]) settings.exercise = DEFAULT_EXERCISE;
 if (params.has('fast')) settings.fast = params.get('fast') === '1';
+if (EXERCISES[params.get('ex')]) settings.exercise = params.get('ex');
 const allowGpu = params.get('gpu') !== '0';
 const saveSettings = () => writeJSON(SETTINGS_KEY, settings);
+
+const currentEx = () => EXERCISES[settings.exercise];
+const targetFor = (ex) => settings.targets[ex.id] ?? ex.target.default;
 
 // ---------- voice and beep ----------
 class Speaker {
@@ -162,7 +155,17 @@ function setText(el, text) {
 
 // ---------- setup screen ----------
 function renderSettings() {
-  $('tValue').textContent = fmtDeg(settings.target);
+  const ex = currentEx();
+  for (const b of document.querySelectorAll('[data-exercise]')) {
+    b.setAttribute('aria-checked', String(b.dataset.exercise === ex.id));
+  }
+  $('exIntro').textContent = ex.intro;
+  $('tLabel').textContent = ex.target.label;
+  $('tHint').textContent = ex.target.hint;
+  $('tValue').textContent = ex.fmt(targetFor(ex));
+  $('tipsList').innerHTML = [...ex.tips, 'Sube el volumen. Con el iPhone en silencio puede que no suene.']
+    .map((tip) => `<li>${tip}</li>`)
+    .join('');
   $('optVoice').checked = settings.voice;
   $('optFast').checked = settings.fast;
   for (const b of document.querySelectorAll('[data-facing]')) {
@@ -171,12 +174,20 @@ function renderSettings() {
 }
 
 function changeTarget(delta) {
-  settings.target = Math.max(TARGET_MIN, Math.min(TARGET_MAX, settings.target + delta));
+  const ex = live?.ex ?? currentEx();
+  settings.targets[ex.id] = Math.max(ex.target.min, Math.min(ex.target.max, targetFor(ex) + delta));
   saveSettings();
   renderSettings();
-  if (live) live.counter.target = settings.target;
+  if (live) live.counter.target = targetFor(ex);
 }
 
+for (const b of document.querySelectorAll('[data-exercise]')) {
+  b.onclick = () => {
+    settings.exercise = b.dataset.exercise;
+    saveSettings();
+    renderSettings();
+  };
+}
 $('tMinus').onclick = () => changeTarget(-1);
 $('tPlus').onclick = () => changeTarget(1);
 $('optVoice').onchange = (e) => {
@@ -363,13 +374,15 @@ let lastSource = null;
 let started = false; // the user tapped Empezar at least once: never auto-reload after this
 
 function newLive(source) {
+  const ex = currentEx();
   return {
     source,
+    ex,
     running: true,
-    filter: new LegFilter(),
-    counter: new RepCounter(settings.target),
+    filter: ex.makeFilter(),
+    counter: ex.makeCounter(targetFor(ex)),
     banner: null,
-    depthFlashUntil: 0,
+    hitFlashUntil: 0,
     lastRepT: 0,
     setReps: [],
     t0: performance.now(),
@@ -397,7 +410,7 @@ async function start(source) {
     show('live');
     renderControls();
     requestWakeLock();
-    speaker.say('Listo. Ponte de lado, con el cuerpo completo en cuadro.');
+    speaker.say(live.ex.ready);
     if (source.kind === 'file' && params.get('step') === '1') stepThrough();
     else scheduleNext();
   } catch (err) {
@@ -444,6 +457,8 @@ async function onFrame(_now, meta) {
 
 async function processFrame(meta) {
   const st = live;
+  const ex = st.ex;
+  const target = targetFor(ex);
   const k = Math.min(1, WORK_MAX_SIDE / Math.max(video.videoWidth, video.videoHeight));
   const w = Math.round((video.videoWidth * k) / 2) * 2;
   const h = Math.round((video.videoHeight * k) / 2) * 2;
@@ -458,14 +473,10 @@ async function processFrame(meta) {
   if (live !== st) return; // session ended while the model was running
 
   const xy = st.filter.update(found);
-  let thigh = null;
-  if (xy) {
-    const a = angles(xy);
-    thigh = a.thigh;
-    for (const ev of st.counter.update(t, a.thigh, a.knee, a.torso)) onEvent(st, ev, t);
-  }
+  const value = xy ? ex.value(xy) : null;
+  if (xy) for (const ev of st.counter.update(t, xy)) onEvent(st, ev, t);
   if (st.setReps.length && !st.counter.inRep && t - st.lastRepT > SET_REST_S) {
-    const p = setSummaryPhrase(st.setReps, settings.target);
+    const p = ex.setPhrase(st.setReps, target);
     speaker.say(p.spoken);
     st.banner = { text: p.text, color: 'white', until: t + BANNER_S * 2 };
     st.setReps = [];
@@ -473,37 +484,44 @@ async function processFrame(meta) {
 
   // paint the analysed frame and its overlay in one go (no flicker, overlay matches the frame)
   ctx.drawImage(work, 0, 0);
-  if (xy) drawLegs(ctx, xy, settings.target, st.counter.inRep, Math.min(w, h) / 720);
-  renderHud(st, t, thigh, xy);
+  if (xy) ex.draw(ctx, xy, target, st.counter.inRep, Math.min(w, h) / 720);
+  renderHud(st, t, value, xy);
   renderFps(st);
 }
 
 function onEvent(st, ev, t) {
   if (ev.kind === 'depth') {
     speaker.beep();
-    st.depthFlashUntil = t + DEPTH_FLASH_S;
+    st.hitFlashUntil = t + HIT_FLASH_S;
     return;
   }
-  const fb = repFeedback(ev.rep, settings.target);
+  const fb = st.ex.repFeedback(ev.rep, targetFor(st.ex));
   speaker.say(fb.spoken);
   st.banner = { text: fb.text, color: fb.color, until: t + BANNER_S };
   st.lastRepT = t;
   st.setReps.push(ev.rep);
 }
 
-const gaugeY = (a) => `${((GAUGE_TOP - Math.max(GAUGE_BOTTOM, Math.min(GAUGE_TOP, a))) / (GAUGE_TOP - GAUGE_BOTTOM)) * 100}%`;
+function gaugeY(ex, v) {
+  const { top, bottom } = ex.gauge;
+  const c = Math.max(bottom, Math.min(top, v));
+  return `${((top - c) / (top - bottom)) * 100}%`;
+}
 
-function renderHud(st, t, thigh, xy) {
+function renderHud(st, t, value, xy) {
+  const ex = st.ex;
+  const target = targetFor(ex);
   setText($('repCount'), `Rep ${st.counter.reps.length}`);
-  setText($('you'), thigh == null ? 'Tú —' : `Tú ${fmtDeg(thigh)}`);
-  setText($('youLabel'), thigh == null ? '' : positionLabel(thigh));
-  setText($('targetText'), `Objetivo ${fmtDeg(settings.target)}`);
-  setText($('targetLabel'), positionLabel(settings.target));
+  setText($('metricName'), ex.metric);
+  setText($('you'), value == null ? 'Tú —' : `Tú ${ex.fmt(value)}`);
+  setText($('youLabel'), value == null ? '' : ex.positionLabel(value, target));
+  setText($('targetText'), `Objetivo ${ex.fmt(target)}`);
+  setText($('targetLabel'), ex.positionLabel(target, target));
 
   let note = null;
-  if (t < st.depthFlashUntil) note = { text: '¡PROFUNDIDAD! Sube', color: 'green' };
+  if (t < st.hitFlashUntil) note = { text: ex.hit, color: 'green' };
   else if (st.banner && t < st.banner.until) note = st.banner;
-  else if (!xy) note = { text: 'Ponte de lado, cuerpo completo en cuadro', color: 'orange' };
+  else if (!xy) note = { text: ex.lost, color: 'orange' };
   const banner = $('banner');
   banner.hidden = !note;
   if (note) {
@@ -511,18 +529,18 @@ function renderHud(st, t, thigh, xy) {
     banner.dataset.color = note.color;
   }
 
-  const tol = settings.target + DEPTH_TOL;
-  $('gZone').style.top = gaugeY(tol);
-  $('gParallel').style.top = gaugeY(0);
-  $('gTarget').style.top = gaugeY(settings.target);
+  const zone = target + ex.tol;
+  $('gZone').style.top = gaugeY(ex, zone);
+  $('gParallel').style.top = gaugeY(ex, ex.gauge.ref);
+  $('gTarget').style.top = gaugeY(ex, target);
   const min = $('gMin');
   min.hidden = !st.counter.inRep;
-  if (st.counter.inRep) min.style.top = gaugeY(st.counter.minThigh);
+  if (st.counter.inRep) min.style.top = gaugeY(ex, st.counter.peak);
   const dot = $('gDot');
-  dot.hidden = thigh == null;
-  if (thigh != null) {
-    dot.style.top = gaugeY(thigh);
-    dot.classList.toggle('hit', thigh <= tol);
+  dot.hidden = value == null;
+  if (value != null) {
+    dot.style.top = gaugeY(ex, value);
+    dot.classList.toggle('hit', value <= zone);
   }
 }
 
@@ -568,7 +586,7 @@ $('cCam').onclick = async () => {
   renderSettings();
   try {
     await openCamera(settings.facing);
-    live.filter = new LegFilter();
+    live.filter = live.ex.makeFilter();
     engine.reset();
     flash(settings.facing === 'user' ? 'Cámara frontal' : 'Cámara trasera');
     scheduleNext();
@@ -578,7 +596,7 @@ $('cCam').onclick = async () => {
 };
 $('cReset').onclick = () => {
   if (!live) return;
-  Object.assign(live, { filter: new LegFilter(), counter: new RepCounter(settings.target), setReps: [] });
+  Object.assign(live, { filter: live.ex.makeFilter(), counter: live.ex.makeCounter(targetFor(live.ex)), setReps: [] });
   engine.reset();
   flash('Conteo reiniciado');
 };
@@ -616,8 +634,9 @@ function finish() {
   releaseWakeLock();
   if ('speechSynthesis' in window && !st.counter.reps.length) speechSynthesis.cancel();
   const reps = st.counter.reps;
-  if (reps.length) saveHistory(reps);
-  showSummary(reps, settings.target, new Date());
+  const target = targetFor(st.ex);
+  if (reps.length) saveHistory(st.ex.id, target, reps);
+  showSummary(st.ex, reps, target, new Date());
 }
 
 // ---------- summary and history ----------
@@ -626,41 +645,45 @@ const fmtWhen = (d) =>
 
 let summaryText = '';
 
-function showSummary(reps, target, when) {
-  const bottoms = reps.map((r) => r.bottomThigh);
-  const hit = reps.filter((r) => depthVerdict(r.bottomThigh, target) === 'objetivo').length;
-  $('sumTitle').textContent = `Resumen · ${fmtWhen(when)}`;
+function showSummary(ex, reps, target, when) {
+  $('sumTitle').textContent = `${ex.name} · ${fmtWhen(when)}`;
   const stat = (label, value) => `<div class="stat"><span>${label}</span><b>${value}</b></div>`;
   $('sumStats').innerHTML = reps.length
     ? stat('Repeticiones', reps.length) +
-      stat('A profundidad', `${hit} / ${reps.length}`) +
-      stat('Más profunda', fmtDeg(Math.min(...bottoms))) +
-      stat('Promedio', fmtDeg(bottoms.reduce((a, b) => a + b, 0) / bottoms.length)) +
-      stat('Objetivo', fmtDeg(target))
+      ex
+        .stats(reps, target)
+        .map(([l, v]) => stat(l, v))
+        .join('') +
+      stat('Objetivo', ex.fmt(target))
     : stat('Repeticiones', 0);
-  const body = $('sumTable').querySelector('tbody');
-  body.replaceChildren(
-    ...reps.map((r) => {
-      const tr = document.createElement('tr');
-      const v = depthVerdict(r.bottomThigh, target);
-      for (const [text, cls] of [
-        [r.number, ''],
-        [fmtDeg(r.bottomThigh), ''],
-        [VERDICT_TEXT[v], `v-${v}`],
-        [`${r.descentS.toFixed(1)} s`, ''],
-        [`${r.ascentS.toFixed(1)} s`, ''],
-        [`${Math.round(r.bottomTorso)}°`, ''],
-      ]) {
-        const td = document.createElement('td');
-        td.textContent = text;
-        if (cls) td.className = cls;
-        tr.append(td);
-      }
-      return tr;
+  $('sumHead').replaceChildren(
+    ...ex.columns.map((c) => {
+      const th = document.createElement('th');
+      th.textContent = c;
+      return th;
     }),
   );
+  $('sumTable')
+    .querySelector('tbody')
+    .replaceChildren(
+      ...reps.map((r) => {
+        const tr = document.createElement('tr');
+        const v = ex.verdict(r, target);
+        for (const cell of ex.row(r)) {
+          const td = document.createElement('td');
+          if (cell === null) {
+            td.textContent = ex.verdictLabel[v];
+            td.className = `v-${v}`;
+          } else {
+            td.textContent = cell;
+          }
+          tr.append(td);
+        }
+        return tr;
+      }),
+    );
   $('sumTable').hidden = !reps.length;
-  const notes = sessionNotes(reps, target);
+  const notes = ex.notes(reps, target);
   $('sumNotes').replaceChildren(
     ...notes.map((n) => {
       const li = document.createElement('li');
@@ -669,32 +692,35 @@ function showSummary(reps, target, when) {
     }),
   );
   summaryText = [
-    `Sentadilla · ${fmtWhen(when)} · objetivo ${fmtDeg(target)}`,
-    ...reps.map((r) => `Rep ${r.number}: muslo ${fmtDeg(r.bottomThigh)} (${VERDICT_TEXT[depthVerdict(r.bottomThigh, target)]})`),
+    `${ex.name} · ${fmtWhen(when)} · objetivo ${ex.fmt(target)}`,
+    ...reps.map((r) => ex.shareLine(r, target)),
     '',
     ...notes.map((n) => `- ${n}`),
   ].join('\n');
   show('summary');
 }
 
-function saveHistory(reps) {
+function saveHistory(exercise, target, reps) {
   const history = readJSON(HISTORY_KEY, []);
-  history.unshift({ at: new Date().toISOString(), target: settings.target, reps });
+  history.unshift({ at: new Date().toISOString(), exercise, target, reps });
   writeJSON(HISTORY_KEY, history.slice(0, HISTORY_MAX));
 }
 
 function renderHistory() {
-  const history = readJSON(HISTORY_KEY, []);
+  const history = readJSON(HISTORY_KEY, []).filter((s) => s.reps?.length);
   $('history').hidden = !history.length;
   $('historyList').replaceChildren(
     ...history.map((s) => {
+      const ex = EXERCISES[s.exercise] || EXERCISES.squat; // sessions saved before curl existed are squats
       const li = document.createElement('li');
       const btn = document.createElement('button');
       btn.type = 'button';
-      const hit = s.reps.filter((r) => depthVerdict(r.bottomThigh, s.target) === 'objetivo').length;
-      const best = Math.min(...s.reps.map((r) => r.bottomThigh));
-      btn.innerHTML = `<b>${fmtWhen(new Date(s.at))}</b><span>${s.reps.length} reps · ${hit} a profundidad · mejor ${fmtDeg(best)}</span>`;
-      btn.onclick = () => showSummary(s.reps, s.target, new Date(s.at));
+      const title = document.createElement('b');
+      title.textContent = `${ex.name} · ${fmtWhen(new Date(s.at))}`;
+      const line = document.createElement('span');
+      line.textContent = ex.historyLine(s.reps, s.target);
+      btn.append(title, line);
+      btn.onclick = () => showSummary(ex, s.reps, s.target, new Date(s.at));
       li.append(btn);
       return li;
     }),
@@ -708,7 +734,7 @@ $('home').onclick = () => {
 };
 $('share').onclick = async () => {
   try {
-    if (navigator.share) await navigator.share({ title: 'Sentadilla', text: summaryText });
+    if (navigator.share) await navigator.share({ title: 'Coach de Gym', text: summaryText });
     else {
       await navigator.clipboard.writeText(summaryText);
       $('share').textContent = 'Copiado';
@@ -748,7 +774,7 @@ renderHistory();
 show('setup');
 registerServiceWorker();
 
-// test hook: ?video=<url>&autostart=1 plays a clip as if it were the camera
+// test hook: ?video=<url>&autostart=1 plays a clip as if it were the camera (&ex=curl picks the exercise)
 if (params.get('video')) {
   const source = { kind: 'file', url: params.get('video') };
   if (params.get('autostart') === '1') start(source);

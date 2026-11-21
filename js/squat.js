@@ -1,29 +1,19 @@
-// Squat logic: joint smoothing, rep counting and coaching phrases.
+// Squat: thigh angle vs the floor, depth beep, spoken verdict per rep.
 // Port of src/squat_coach/live.py and metrics.py (same thresholds as the Mac version).
+import { JointFilter, deg, fmtDeg, innerAngle, mean, percentile } from './common.js';
+import { drawLegs } from './draw.js';
 
 export const DEPTH_TOL = 3; // degrees of slack when judging depth
-export const TORSO_WARN = 50; // torso lean from vertical at the bottom
-const THIGH_LEN_TOL = 0.4; // drop frames whose thigh length jumps this much (joint misplaced)
+const TORSO_WARN = 50; // torso lean from vertical at the bottom
 const MIN_REP_S = 0.6;
 const UP_MAX = 65; // rep ends when thigh rises above min(UP_MAX, baseline - 12)
 const DOWN_DELTA = 20; // rep starts this far below the "up" threshold
-const EMA_ALPHA = 0.55; // 1 = no smoothing
-const SIDE_HYSTERESIS = 0.1;
-const MAX_MISSED = 10; // frames we keep the last skeleton when the pose drops out
 const BASELINE_DEFAULT = 80;
 const FAST_DESCENT_S = 1.0;
 const INCONSISTENT_RANGE = 8;
 
-export const JOINTS = ['shoulder', 'hip', 'knee', 'ankle'];
 // COCO-17 keypoint indices (left, right) = subject's left / right
 const KP = { shoulder: [5, 6], hip: [11, 12], knee: [13, 14], ankle: [15, 16] };
-
-const deg = (rad) => (rad * 180) / Math.PI;
-
-export function fmtDeg(value) {
-  const r = Math.round(value);
-  return `${r > 0 ? '+' : r < 0 ? '−' : ''}${Math.abs(r)}°`;
-}
 
 export function positionLabel(thigh) {
   if (thigh > 15) return 'sobre paralelo';
@@ -34,81 +24,15 @@ export function positionLabel(thigh) {
 
 export function depthVerdict(bottom, target) {
   if (bottom <= target + DEPTH_TOL) return 'objetivo';
-  if (bottom <= DEPTH_TOL) return 'paralelo';
+  if (bottom <= DEPTH_TOL) return 'casi';
   return 'corta';
-}
-
-export const VERDICT_TEXT = { objetivo: 'Objetivo', paralelo: 'Casi', corta: 'Corta' };
-
-function median(values) {
-  const s = [...values].sort((a, b) => a - b);
-  const m = s.length >> 1;
-  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
-}
-
-function percentile(values, p) {
-  const s = [...values].sort((a, b) => a - b);
-  const idx = ((s.length - 1) * p) / 100;
-  const lo = Math.floor(idx);
-  const hi = Math.ceil(idx);
-  return s[lo] + (s[hi] - s[lo]) * (idx - lo);
 }
 
 /** Thigh angle vs horizontal (+90 standing, 0 parallel, negative = hip below knee), knee and torso angles. */
 export function angles({ shoulder, hip, knee, ankle }) {
   const thigh = deg(Math.atan2(knee[1] - hip[1], Math.abs(knee[0] - hip[0])));
-  const v1 = [hip[0] - knee[0], hip[1] - knee[1]];
-  const v2 = [ankle[0] - knee[0], ankle[1] - knee[1]];
-  const cos = (v1[0] * v2[0] + v1[1] * v2[1]) / (Math.hypot(...v1) * Math.hypot(...v2) + 1e-9);
-  const kneeAngle = deg(Math.acos(Math.max(-1, Math.min(1, cos))));
   const torso = deg(Math.atan2(Math.abs(shoulder[0] - hip[0]), hip[1] - shoulder[1]));
-  return { thigh, knee: kneeAngle, torso };
-}
-
-/** Online smoothing and sanity check of the leg joints. */
-export class LegFilter {
-  constructor() {
-    this.xy = null;
-    this.side = 1;
-    this.lengths = [];
-    this.missed = 0;
-  }
-
-  miss() {
-    this.missed += 1;
-    if (this.missed > MAX_MISSED) this.xy = null;
-    return this.xy;
-  }
-
-  /** found = { kps: Float32Array(17*2), scores: Float32Array(17) } or null. */
-  update(found) {
-    if (!found) return this.miss();
-    const { kps, scores } = found;
-    const conf = [0, 1].map((side) => (scores[KP.hip[side]] + scores[KP.knee[side]] + scores[KP.ankle[side]]) / 3);
-    if (conf[1 - this.side] > conf[this.side] + SIDE_HYSTERESIS) this.side = 1 - this.side;
-    const pts = {};
-    for (const name of JOINTS) {
-      const i = KP[name][this.side];
-      pts[name] = [kps[2 * i], kps[2 * i + 1]];
-    }
-    const thighLen = Math.hypot(pts.hip[0] - pts.knee[0], pts.hip[1] - pts.knee[1]);
-    if (this.lengths.length >= 15 && Math.abs(thighLen / median(this.lengths) - 1) > THIGH_LEN_TOL) {
-      return this.miss(); // implausible leg: the model put a joint in the wrong place
-    }
-    this.lengths.push(thighLen);
-    if (this.lengths.length > 90) this.lengths.shift();
-    this.missed = 0;
-    if (!this.xy) {
-      this.xy = pts;
-    } else {
-      for (const name of JOINTS) {
-        const [x, y] = pts[name];
-        const [px, py] = this.xy[name];
-        this.xy[name] = [EMA_ALPHA * x + (1 - EMA_ALPHA) * px, EMA_ALPHA * y + (1 - EMA_ALPHA) * py];
-      }
-    }
-    return this.xy;
-  }
+  return { thigh, knee: innerAngle(hip, knee, ankle), torso };
 }
 
 /** Real-time rep detection with hysteresis on the thigh angle. */
@@ -125,6 +49,11 @@ export class RepCounter {
     this.bottom = null;
   }
 
+  /** Deepest angle of the rep in progress (for the gauge). */
+  get peak() {
+    return this.minThigh;
+  }
+
   thresholds() {
     const base = this.standing.length >= 20 ? percentile(this.standing, 90) : BASELINE_DEFAULT;
     const up = Math.min(UP_MAX, base - 12);
@@ -132,7 +61,8 @@ export class RepCounter {
   }
 
   /** Returns events: { kind: 'depth' } when target depth is reached, { kind: 'rep', rep } when a rep ends. */
-  update(t, thigh, knee, torso) {
+  update(t, xy) {
+    const { thigh, knee, torso } = angles(xy);
     const [up, down] = this.thresholds();
     const events = [];
     if (!this.inRep) {
@@ -189,7 +119,7 @@ export function repFeedback(rep, target) {
   let color;
   if (verdict === 'objetivo') {
     [spoken, status, color] = [`${rep.number}. ¡Buena!`, 'profundidad objetivo', 'green'];
-  } else if (verdict === 'paralelo') {
+  } else if (verdict === 'casi') {
     [spoken, status, color] = [`${rep.number}. Casi, faltaron ${gap} grados.`, `casi · faltaron ${gap}°`, 'orange'];
   } else {
     [spoken, status, color] = [`${rep.number}. Más abajo, faltaron ${gap} grados.`, `faltaron ${gap}°`, 'red'];
@@ -201,14 +131,6 @@ export function repFeedback(rep, target) {
   return { spoken, text: `Rep ${rep.number}: muslo ${fmtDeg(rep.bottomThigh)} · ${status}`, color };
 }
 
-export function setSummaryPhrase(reps, target) {
-  const ok = reps.filter((r) => depthVerdict(r.bottomThigh, target) === 'objetivo').length;
-  return {
-    spoken: `Serie terminada. ${reps.length} repeticiones, ${ok} a profundidad.`,
-    text: `Serie: ${reps.length} reps · ${ok} a profundidad`,
-  };
-}
-
 /** Coaching notes for the summary screen (port of metrics.feedback). */
 export function sessionNotes(reps, target) {
   if (!reps.length) {
@@ -218,7 +140,7 @@ export function sessionNotes(reps, target) {
   }
   const notes = [];
   const bottoms = reps.map((r) => r.bottomThigh);
-  const mean = bottoms.reduce((a, b) => a + b, 0) / bottoms.length;
+  const avg = mean(bottoms);
   const best = reps[bottoms.indexOf(Math.min(...bottoms))];
   const worst = reps[bottoms.indexOf(Math.max(...bottoms))];
   const hit = reps.filter((r) => depthVerdict(r.bottomThigh, target) === 'objetivo');
@@ -230,7 +152,7 @@ export function sessionNotes(reps, target) {
   } else {
     notes.push(
       `Profundidad: llegaste al objetivo en ${hit.length} de ${reps.length} reps. En promedio tu muslo quedó en ` +
-        `${fmtDeg(mean)} (${positionLabel(mean)}); te faltan ~${Math.round(mean - target)}° para ${fmtDeg(target)}. ` +
+        `${fmtDeg(avg)} (${positionLabel(avg)}); te faltan ~${Math.round(avg - target)}° para ${fmtDeg(target)}. ` +
         'Pista: piensa en «sentarte entre los talones», empuja las rodillas hacia afuera y baja más lento.',
     );
     if (worst.number !== best.number) {
@@ -264,3 +186,73 @@ export function sessionNotes(reps, target) {
   notes.push('Límite: análisis 2D con una sola cámara; ángulos aproximados (±5°). La cámara debe estar de lado.');
   return notes;
 }
+
+const VERDICT_LABEL = { objetivo: 'Objetivo', casi: 'Casi', corta: 'Corta' };
+
+/** Everything the app needs to coach a squat. */
+export const squat = {
+  id: 'squat',
+  name: 'Sentadilla',
+  intro: 'Te mira de lado, mide tu muslo contra el paralelo y te dice en voz alta cómo fue cada repetición.',
+  target: {
+    default: -10,
+    min: -25,
+    max: 10,
+    label: 'Profundidad objetivo',
+    hint: '0° = muslo paralelo al suelo. Negativo = cadera por debajo de la rodilla.',
+  },
+  tol: DEPTH_TOL,
+  metric: 'ángulo del muslo',
+  fmt: fmtDeg,
+  gauge: { top: 90, bottom: -30, ref: 0 }, // dot goes down as you go deeper; blue mark = parallel
+  tips: [
+    'iPhone fijo (trípode o apoyado), <b>de lado a ti</b>, a la altura de la cadera, a 2–3 m.',
+    'Cuerpo completo en cuadro: cadera, rodilla y tobillo siempre visibles.',
+    'Si el disco tapa la cadera, gira el teléfono 20–30° hacia tu frente.',
+  ],
+  ready: 'Listo. Ponte de lado, con el cuerpo completo en cuadro.',
+  lost: 'Ponte de lado, cuerpo completo en cuadro',
+  hit: '¡PROFUNDIDAD! Sube',
+  makeFilter: () =>
+    new JointFilter({ kp: KP, sideJoints: ['hip', 'knee', 'ankle'], lengthPairs: [['hip', 'knee']], lengthTol: 0.4 }),
+  makeCounter: (target) => new RepCounter(target),
+  value: (xy) => angles(xy).thigh,
+  positionLabel,
+  draw: drawLegs,
+  repFeedback,
+  verdict: (rep, target) => depthVerdict(rep.bottomThigh, target),
+  verdictLabel: VERDICT_LABEL,
+  repValue: (rep) => rep.bottomThigh,
+  columns: ['Rep', 'Muslo', 'Resultado', 'Bajada', 'Subida', 'Torso'],
+  row: (rep) => [
+    rep.number,
+    fmtDeg(rep.bottomThigh),
+    null, // verdict cell, filled by the app
+    `${rep.descentS.toFixed(1)} s`,
+    `${rep.ascentS.toFixed(1)} s`,
+    `${Math.round(rep.bottomTorso)}°`,
+  ],
+  stats(reps, target) {
+    const v = reps.map((r) => r.bottomThigh);
+    const hit = reps.filter((r) => depthVerdict(r.bottomThigh, target) === 'objetivo').length;
+    return [
+      ['A profundidad', `${hit} / ${reps.length}`],
+      ['Más profunda', fmtDeg(Math.min(...v))],
+      ['Promedio', fmtDeg(mean(v))],
+    ];
+  },
+  shareLine: (rep, target) =>
+    `Rep ${rep.number}: muslo ${fmtDeg(rep.bottomThigh)} (${VERDICT_LABEL[depthVerdict(rep.bottomThigh, target)]})`,
+  historyLine(reps, target) {
+    const hit = reps.filter((r) => depthVerdict(r.bottomThigh, target) === 'objetivo').length;
+    return `${reps.length} reps · ${hit} a profundidad · mejor ${fmtDeg(Math.min(...reps.map((r) => r.bottomThigh)))}`;
+  },
+  notes: sessionNotes,
+  setPhrase(reps, target) {
+    const ok = reps.filter((r) => depthVerdict(r.bottomThigh, target) === 'objetivo').length;
+    return {
+      spoken: `Serie terminada. ${reps.length} repeticiones, ${ok} a profundidad.`,
+      text: `Serie: ${reps.length} reps · ${ok} a profundidad`,
+    };
+  },
+};

@@ -1,7 +1,7 @@
 {
-  "name": "Coach de Sentadilla",
-  "short_name": "Sentadilla",
-  "description": "Coach de sentadilla en vivo: mide el ángulo del muslo y te corrige por voz.",
+  "name": "Coach de Gym",
+  "short_name": "Coach Gym",
+  "description": "Coach en vivo para sentadilla y curl de bíceps: mide tus ángulos con la cámara y te corrige por voz.",
   "lang": "es",
   "start_url": "./",
   "scope": "./",

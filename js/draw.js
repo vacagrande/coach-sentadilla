@@ -1,4 +1,5 @@
-// Leg overlay on the camera frame: green = you, red = target depth, blue dashed = knee height.
+// Overlays on the camera frame. Squat: green = your leg, red = target depth, blue dashed = knee height.
+// Curl: green = your arm, red = forearm at the target angle, blue dashed = torso line (keep the elbow on it).
 
 const GREEN = 'rgb(70, 230, 90)';
 const RED = 'rgb(235, 60, 75)';
@@ -52,4 +53,39 @@ export function drawLegs(ctx, xy, target, showTarget, s) {
   line(ctx, hip, knee, GREEN, t + 1);
   line(ctx, knee, ankle, GREEN, t + 1);
   for (const p of [hip, knee, ankle]) joint(ctx, p, GREEN, r, ring);
+}
+
+/** Where the wrist would be with the same forearm length at the target elbow angle (same side as now). */
+export function targetWrist(shoulder, elbow, wrist, target) {
+  const ux = shoulder[0] - elbow[0];
+  const uy = shoulder[1] - elbow[1];
+  const ul = Math.hypot(ux, uy) || 1;
+  const fl = Math.hypot(wrist[0] - elbow[0], wrist[1] - elbow[1]);
+  const side = Math.sign(ux * (wrist[1] - elbow[1]) - uy * (wrist[0] - elbow[0])) || 1;
+  const a = (side * target * Math.PI) / 180;
+  const dx = (ux / ul) * Math.cos(a) - (uy / ul) * Math.sin(a);
+  const dy = (ux / ul) * Math.sin(a) + (uy / ul) * Math.cos(a);
+  return [elbow[0] + dx * fl, elbow[1] + dy * fl];
+}
+
+export function drawArm(ctx, xy, target, showTarget, s) {
+  const { shoulder, elbow, wrist, hip } = xy;
+  const t = Math.max(2, 5 * s);
+  const r = Math.max(4, 9 * s);
+  const ring = Math.max(1, 2 * s);
+  ctx.lineCap = 'round';
+  const upper = Math.hypot(shoulder[0] - elbow[0], shoulder[1] - elbow[1]);
+  const tx = hip[0] - shoulder[0];
+  const ty = hip[1] - shoulder[1];
+  const tl = Math.hypot(tx, ty) || 1;
+  const ref = [shoulder[0] + (tx / tl) * upper * 1.15, shoulder[1] + (ty / tl) * upper * 1.15];
+  line(ctx, shoulder, ref, BLUE, Math.max(1, t / 2), [10 * s, 10 * s]);
+  if (showTarget) {
+    const tgt = targetWrist(shoulder, elbow, wrist, target);
+    line(ctx, elbow, tgt, RED, t);
+    joint(ctx, tgt, RED, r, ring);
+  }
+  line(ctx, shoulder, elbow, GREEN, t + 1);
+  line(ctx, elbow, wrist, GREEN, t + 1);
+  for (const p of [shoulder, elbow, wrist]) joint(ctx, p, GREEN, r, ring);
 }

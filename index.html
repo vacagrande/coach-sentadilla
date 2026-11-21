@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <title>Coach de Sentadilla</title>
-  <meta name="description" content="Coach de sentadilla en vivo: mide el ángulo del muslo y te corrige por voz.">
+  <title>Coach de Gym</title>
+  <meta name="description" content="Coach en vivo para sentadilla y curl de bíceps: mide tus ángulos con la cámara y te corrige por voz.">
   <meta name="theme-color" content="#0b0c0d">
   <meta name="mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <meta name="apple-mobile-web-app-title" content="Sentadilla">
+  <meta name="apple-mobile-web-app-title" content="Coach Gym">
   <link rel="manifest" href="manifest.webmanifest">
   <link rel="icon" href="icons/icon-192.png">
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
@@ -21,24 +21,29 @@
     <header class="brand">
       <img src="icons/icon-192.png" alt="" width="56" height="56">
       <div>
-        <h1>Coach de Sentadilla</h1>
-        <p>Te mira de lado, mide tu muslo contra el paralelo y te dice en voz alta cómo fue cada repetición.</p>
+        <h1>Coach de Gym</h1>
+        <p id="exIntro">Te mira de lado, mide tu muslo contra el paralelo y te dice en voz alta cómo fue cada repetición.</p>
       </div>
     </header>
 
+    <div class="segmented exercises" role="radiogroup" aria-label="Ejercicio">
+      <button type="button" data-exercise="squat" role="radio">Sentadilla</button>
+      <button type="button" data-exercise="curl" role="radio">Curl de bíceps</button>
+    </div>
+
     <section class="card">
       <div class="field">
-        <span class="label">Profundidad objetivo</span>
+        <span class="label" id="tLabel">Profundidad objetivo</span>
         <div class="stepper">
-          <button type="button" id="tMinus" aria-label="Más profundo">−</button>
+          <button type="button" id="tMinus" aria-label="Bajar objetivo">−</button>
           <output id="tValue">−10°</output>
-          <button type="button" id="tPlus" aria-label="Menos profundo">+</button>
+          <button type="button" id="tPlus" aria-label="Subir objetivo">+</button>
         </div>
       </div>
       <p class="hint" id="tHint">0° = muslo paralelo al suelo. Negativo = cadera por debajo de la rodilla.</p>
 
       <label class="switch-row">
-        <span><span class="label">Voz y pitido</span><span class="hint">pitido al llegar a la profundidad, voz al final de cada rep</span></span>
+        <span><span class="label">Voz y pitido</span><span class="hint">pitido al llegar al objetivo, voz al final de cada rep</span></span>
         <input type="checkbox" id="optVoice" role="switch">
       </label>
 
@@ -65,12 +70,7 @@
 
     <section class="card tips">
       <h2>Cómo ponerte</h2>
-      <ol>
-        <li>iPhone fijo (trípode o apoyado), <b>de lado a ti</b>, a la altura de la cadera, a 2–3 m.</li>
-        <li>Cuerpo completo en cuadro: cadera, rodilla y tobillo siempre visibles.</li>
-        <li>Si el disco tapa la cadera, gira el teléfono 20–30° hacia tu frente.</li>
-        <li>Sube el volumen. Con el iPhone en silencio puede que no suene.</li>
-      </ol>
+      <ol id="tipsList"></ol>
     </section>
 
     <section class="card install" id="installHint" hidden>
@@ -100,7 +100,7 @@
     <canvas id="canvas"></canvas>
 
     <div class="hud">
-      <div class="cell"><b id="repCount">Rep 0</b><span>ángulo del muslo</span></div>
+      <div class="cell"><b id="repCount">Rep 0</b><span id="metricName">ángulo del muslo</span></div>
       <div class="cell you"><b id="you">Tú —</b><span id="youLabel"></span></div>
       <div class="cell tgt"><b id="targetText">Objetivo −10°</b><span id="targetLabel"></span></div>
     </div>
@@ -138,7 +138,7 @@
     <div class="stats" id="sumStats"></div>
     <div class="table-wrap">
       <table id="sumTable">
-        <thead><tr><th>Rep</th><th>Muslo</th><th>Resultado</th><th>Bajada</th><th>Subida</th><th>Torso</th></tr></thead>
+        <thead><tr id="sumHead"></tr></thead>
         <tbody></tbody>
       </table>
     </div>
