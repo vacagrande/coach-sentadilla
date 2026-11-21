@@ -1,6 +1,6 @@
 // Coach de Gym (web): camera -> pose -> overlay, beep at the target and spoken feedback per rep.
 // Exercise-specific logic lives in squat.js / curl.js (see exercises.js).
-import { DEFAULT_EXERCISE, EXERCISES } from './exercises.js';
+import { DEFAULT_EXERCISE, EXERCISES, findExercise } from './exercises.js';
 import { IS_IOS, PoseEngine } from './pose.js';
 
 // The camera is shown by the <video> itself at its native frame rate. The model analyses frames as fast as
@@ -47,6 +47,9 @@ const settings = { exercise: DEFAULT_EXERCISE, voice: true, facing: 'environment
 settings.targets = { ...(stored.targets || {}) };
 if (stored.target !== undefined && settings.targets.squat === undefined) settings.targets.squat = stored.target; // old format
 delete settings.target;
+settings.views = { ...(stored.views || {}) }; // camera view used last for each exercise: { squat: 'front', ... }
+if (stored.squatView === 'squat-front' && !settings.views.squat) settings.views.squat = 'front'; // old format
+delete settings.squatView;
 if (!EXERCISES[settings.exercise]) settings.exercise = DEFAULT_EXERCISE;
 if (params.has('fast')) settings.fast = params.get('fast') === '1';
 if (EXERCISES[params.get('ex')]) settings.exercise = params.get('ex');
@@ -179,16 +182,15 @@ function setText(el, text) {
 }
 
 // ---------- setup screen ----------
-const groupOf = (ex) => ex.group || ex.id; // views of one exercise share a group (side / front squat)
-
 function renderSettings() {
   const ex = currentEx();
   for (const b of document.querySelectorAll('[data-exercise]')) {
-    b.setAttribute('aria-checked', String(b.dataset.exercise === groupOf(ex)));
+    b.setAttribute('aria-checked', String(b.dataset.exercise === ex.group));
   }
-  $('viewRow').hidden = groupOf(ex) !== 'squat';
+  // "Vista" (camera from the side / from the front) only shows for exercises that have both
+  $('viewRow').hidden = Object.values(EXERCISES).filter((e) => e.group === ex.group).length < 2;
   for (const b of document.querySelectorAll('[data-view]')) {
-    b.setAttribute('aria-checked', String(b.dataset.view === ex.id));
+    b.setAttribute('aria-checked', String(b.dataset.view === ex.view));
   }
   $('exIntro').textContent = ex.intro;
   $('tLabel').textContent = ex.target.label;
@@ -215,16 +217,20 @@ function changeTarget(delta) {
 
 for (const b of document.querySelectorAll('[data-exercise]')) {
   b.onclick = () => {
-    // "Sentadilla" reopens whichever view (side / front) was used last
-    const id = b.dataset.exercise;
-    settings.exercise = id === 'squat' && EXERCISES[settings.squatView] ? settings.squatView : id;
+    // an exercise reopens with the camera view used last for it
+    const leaving = currentEx();
+    settings.views[leaving.group] = leaving.view;
+    const group = b.dataset.exercise;
+    settings.exercise = findExercise(group, settings.views[group] || 'side').id;
     saveSettings();
     renderSettings();
   };
 }
 for (const b of document.querySelectorAll('[data-view]')) {
   b.onclick = () => {
-    settings.exercise = settings.squatView = b.dataset.view;
+    const ex = findExercise(currentEx().group, b.dataset.view);
+    settings.exercise = ex.id;
+    settings.views[ex.group] = ex.view;
     saveSettings();
     renderSettings();
   };
@@ -645,7 +651,7 @@ function drawOverlay(st, now) {
   st.overlayKey = key;
   clearOverlay();
   ctx.setTransform(k, 0, 0, k, 0, 0);
-  st.ex.draw(ctx, st.drawn, target, st.counter.inRep, Math.min(vw, vh) / 720);
+  st.ex.draw(ctx, st.drawn, target, st.counter.inRep, Math.min(vw, vh) / 720, st.counter);
 }
 
 function startOverlay() {
@@ -743,7 +749,7 @@ function resetHud(ex) {
   setText(el.you, 'Tú —');
   setText(el.youLabel, '');
   setText(el.targetText, `Objetivo ${ex.fmt(target)}`);
-  setText(el.targetLabel, ex.positionLabel(target, target));
+  setText(el.targetLabel, ex.targetLabel ?? ex.positionLabel(target, target));
   setText(el.fps, '');
   for (const node of [el.banner, el.gMin, el.gDot]) setHidden(node, true);
 }
@@ -756,7 +762,7 @@ function renderHud(st, t, value, xy) {
   setText(el.you, value == null ? 'Tú —' : `Tú ${ex.fmt(value)}`);
   setText(el.youLabel, !xy ? '' : value == null ? ex.idleLabel || '' : ex.positionLabel(value, target));
   setText(el.targetText, `Objetivo ${ex.fmt(target)}`);
-  setText(el.targetLabel, ex.positionLabel(target, target));
+  setText(el.targetLabel, ex.targetLabel ?? ex.positionLabel(target, target));
 
   let note = null;
   if (t < st.hitFlashUntil) note = { text: ex.hit, color: 'green' };

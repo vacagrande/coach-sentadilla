@@ -202,6 +202,7 @@ const VERDICT_LABEL = { objetivo: 'Objetivo', casi: 'Casi', corta: 'Corta' };
 export const squat = {
   id: 'squat',
   group: 'squat',
+  view: 'side',
   name: 'Sentadilla',
   intro: 'Te mira de lado, mide tu muslo contra el paralelo y te dice en voz alta cómo fue cada repetición.',
   target: {

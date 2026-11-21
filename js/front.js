@@ -300,6 +300,7 @@ function shiftCell(shift) {
 export const squatFront = {
   id: 'squat-front',
   group: 'squat',
+  view: 'front',
   name: 'Sentadilla de frente',
   intro: 'Te mira de frente y revisa si las rodillas se meten, si la cadera se va a un lado y si los hombros se inclinan.',
   target: {
@@ -310,6 +311,7 @@ export const squatFront = {
     label: 'Apertura mínima de rodillas',
     hint: 'Dónde quedan las rodillas respecto a los pies, en el fondo. 100% = sobre los pies; más = más afuera; menos = se meten.',
   },
+  targetLabel: 'mínimo',
   tol: KNEE_TOL,
   higherIsBetter: true,
   metric: 'rodillas vs pies',

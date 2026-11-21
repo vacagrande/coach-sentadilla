@@ -98,6 +98,45 @@ export function drawFront(ctx, xy, target, active, s) {
   }
 }
 
+const FLARE_SLACK = 3; // same slack as FLARE_TOL in curl_front.js
+
+/**
+ * Curl from the front: both arms (green, or red while that elbow is opening past the target), a dashed blue
+ * line from each shoulder showing where the upper arm rests (keep the elbow on it), and the shoulder line.
+ * `counter` is the CurlFrontCounter: it knows each arm's resting position and current opening.
+ */
+export function drawFrontArms(ctx, xy, target, _active, s, counter) {
+  const t = Math.max(2, 5 * s);
+  const r = Math.max(4, 9 * s);
+  const ring = Math.max(1, 2 * s);
+  ctx.lineCap = 'round';
+  const shMid = [(xy.lShoulder[0] + xy.rShoulder[0]) / 2, (xy.lShoulder[1] + xy.rShoulder[1]) / 2];
+  const hipMid = [(xy.lHip[0] + xy.rHip[0]) / 2, (xy.lHip[1] + xy.rHip[1]) / 2];
+  const len = Math.hypot(hipMid[0] - shMid[0], hipMid[1] - shMid[1]) || 1;
+  const dx = (hipMid[0] - shMid[0]) / len;
+  const dy = (hipMid[1] - shMid[1]) / len;
+  line(ctx, xy.lShoulder, xy.rShoulder, WHITE, Math.max(1, t / 2));
+  for (const [arm, shoulder, elbow, wrist] of [
+    ['left', xy.lShoulder, xy.lElbow, xy.lWrist],
+    ['right', xy.rShoulder, xy.rElbow, xy.rWrist],
+  ]) {
+    const tracker = counter?.arms?.[arm];
+    const rest = tracker?.rest.abd;
+    if (rest != null) {
+      const out = Math.sign(shoulder[0] - shMid[0]) || 1;
+      const a = (rest * Math.PI) / 180;
+      const dir = [dx * Math.cos(a) + out * dy * Math.sin(a), dy * Math.cos(a) - out * dx * Math.sin(a)];
+      const upper = Math.hypot(elbow[0] - shoulder[0], elbow[1] - shoulder[1]);
+      const end = [shoulder[0] + dir[0] * upper * 1.15, shoulder[1] + dir[1] * upper * 1.15];
+      line(ctx, shoulder, end, BLUE, Math.max(1, t / 2), [10 * s, 10 * s]);
+    }
+    const color = tracker && tracker.flare > target + FLARE_SLACK ? RED : GREEN;
+    line(ctx, shoulder, elbow, color, t + 1);
+    line(ctx, elbow, wrist, color, t + 1);
+    for (const p of [shoulder, elbow, wrist]) joint(ctx, p, color, r, ring);
+  }
+}
+
 /** Where the wrist would be with the same forearm length at the target elbow angle (same side as now). */
 export function targetWrist(shoulder, elbow, wrist, target) {
   const ux = shoulder[0] - elbow[0];

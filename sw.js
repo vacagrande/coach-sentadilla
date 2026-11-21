@@ -1,6 +1,6 @@
 // Service worker: works offline after the first visit, and adds the COOP/COEP headers
 // that let ONNX Runtime use several CPU threads (static hosts like GitHub Pages can't set them).
-const VERSION = 'v6';
+const VERSION = 'v7';
 const SHELL_CACHE = `shell-${VERSION}`;
 const BIG_CACHE = 'big-v1'; // models + wasm: large, change rarely, kept across app updates
 const SHELL = [
@@ -11,6 +11,7 @@ const SHELL = [
   'js/app.js',
   'js/common.js',
   'js/curl.js',
+  'js/curl_front.js',
   'js/draw.js',
   'js/exercises.js',
   'js/front.js',

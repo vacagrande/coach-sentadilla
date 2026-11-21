@@ -16,7 +16,15 @@ const FAST_LOWER_S = 0.8;
 const MIN_REP_S = 0.6;
 const MIN_PLAUSIBLE = 20; // an elbow can't close more than this: smaller = a misplaced wrist, ignore the frame
 
-const KP = { shoulder: [5, 6], elbow: [7, 8], wrist: [9, 10], hip: [11, 12] };
+// lShoulder / rShoulder are both shoulders whatever the side: only used to notice the person is facing the camera.
+const KP = { shoulder: [5, 6], elbow: [7, 8], wrist: [9, 10], hip: [11, 12], lShoulder: [5, 5], rShoulder: [6, 6] };
+const FACING_MAX = 0.6; // shoulder width / torso length: ~0.1 side-on, ~0.75 facing the camera
+
+function viewHint({ shoulder, hip, lShoulder, rShoulder }) {
+  const torso = Math.hypot(shoulder[0] - hip[0], shoulder[1] - hip[1]);
+  const facing = torso > 1 ? Math.abs(lShoulder[0] - rShoulder[0]) / torso : 0;
+  return facing > FACING_MAX ? 'Estás de frente: ponte de lado o elige la vista De frente' : null;
+}
 
 /** elbow = inner angle (180 straight, ~40 fully curled); drift = upper arm vs torso; torso = signed lean. */
 export function curlAngles({ shoulder, elbow, wrist, hip }) {
@@ -211,6 +219,8 @@ const VERDICT_LABEL = { objetivo: 'Completa', casi: 'Casi', corta: 'Corta' };
 /** Everything the app needs to coach a bicep curl. */
 export const curl = {
   id: 'curl',
+  group: 'curl',
+  view: 'side',
   name: 'Curl de bíceps',
   intro: 'Te mira de lado, mide el ángulo del codo y te avisa si subes completo, si estiras abajo y si te balanceas.',
   target: {
@@ -246,6 +256,7 @@ export const curl = {
   value: (xy) => curlAngles(xy).elbow,
   positionLabel,
   draw: drawArm,
+  viewHint,
   repFeedback,
   verdict: (rep, target) => curlVerdict(rep.topElbow, target),
   verdictLabel: VERDICT_LABEL,
