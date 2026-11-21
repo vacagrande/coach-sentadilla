@@ -1,0 +1,5 @@
+Models (Apache-2.0), from https://huggingface.co/Tau-J/RTMPose
+- yolox_nano.onnx: yolox_nano_8xb8-300e_humanart-40f6f0d0 (person detector)
+- rtmpose-m.onnx: rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504
+- rtmpose-s.onnx: rtmpose-s_simcc-body7_pt-body7_420e-256x192-acd4a1ef_20230504
+RTMPose / MMPose: https://github.com/open-mmlab/mmpose (Apache-2.0)

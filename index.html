@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Coach de Sentadilla</title>
+  <meta name="description" content="Coach de sentadilla en vivo: mide el ángulo del muslo y te corrige por voz.">
+  <meta name="theme-color" content="#0b0c0d">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Sentadilla">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Inicio -->
+  <main id="setup" class="screen setup">
+    <header class="brand">
+      <img src="icons/icon-192.png" alt="" width="56" height="56">
+      <div>
+        <h1>Coach de Sentadilla</h1>
+        <p>Te mira de lado, mide tu muslo contra el paralelo y te dice en voz alta cómo fue cada repetición.</p>
+      </div>
+    </header>
+
+    <section class="card">
+      <div class="field">
+        <span class="label">Profundidad objetivo</span>
+        <div class="stepper">
+          <button type="button" id="tMinus" aria-label="Más profundo">−</button>
+          <output id="tValue">−10°</output>
+          <button type="button" id="tPlus" aria-label="Menos profundo">+</button>
+        </div>
+      </div>
+      <p class="hint" id="tHint">0° = muslo paralelo al suelo. Negativo = cadera por debajo de la rodilla.</p>
+
+      <label class="switch-row">
+        <span><span class="label">Voz y pitido</span><span class="hint">pitido al llegar a la profundidad, voz al final de cada rep</span></span>
+        <input type="checkbox" id="optVoice" role="switch">
+      </label>
+
+      <div class="field">
+        <span class="label">Cámara</span>
+        <div class="segmented" role="radiogroup">
+          <button type="button" data-facing="environment" role="radio">Trasera</button>
+          <button type="button" data-facing="user" role="radio">Frontal</button>
+        </div>
+      </div>
+
+      <label class="switch-row">
+        <span><span class="label">Modo rápido</span><span class="hint">modelo más liviano (21 MB); úsalo si va lento</span></span>
+        <input type="checkbox" id="optFast" role="switch">
+      </label>
+    </section>
+
+    <button type="button" id="start" class="btn primary big">Empezar</button>
+    <label class="btn ghost">
+      Probar con un video del carrete
+      <input type="file" id="file" accept="video/*" hidden>
+    </label>
+    <p id="status" class="status" role="status"></p>
+
+    <section class="card tips">
+      <h2>Cómo ponerte</h2>
+      <ol>
+        <li>iPhone fijo (trípode o apoyado), <b>de lado a ti</b>, a la altura de la cadera, a 2–3 m.</li>
+        <li>Cuerpo completo en cuadro: cadera, rodilla y tobillo siempre visibles.</li>
+        <li>Si el disco tapa la cadera, gira el teléfono 20–30° hacia tu frente.</li>
+        <li>Sube el volumen. Con el iPhone en silencio puede que no suene.</li>
+      </ol>
+    </section>
+
+    <section class="card install" id="installHint" hidden>
+      <h2>Tenerla como app</h2>
+      <p>En Safari toca <b>Compartir</b> → <b>Agregar a inicio</b>. Después de la primera carga funciona sin internet.</p>
+    </section>
+
+    <section class="card" id="history" hidden>
+      <h2>Sesiones anteriores</h2>
+      <ul id="historyList" class="history"></ul>
+    </section>
+
+    <footer class="foot">Todo se procesa en tu teléfono; el video no sale del dispositivo.</footer>
+  </main>
+
+  <!-- Cargando -->
+  <div id="loading" class="loading" hidden>
+    <div class="spinner" aria-hidden="true"></div>
+    <p id="loadMsg">Preparando…</p>
+    <progress id="loadBar" max="1" value="0"></progress>
+    <p class="hint">La primera vez descarga ~85 MB (usa Wi-Fi); después funciona sin internet.</p>
+  </div>
+
+  <!-- En vivo -->
+  <main id="live" class="screen live" hidden>
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="canvas"></canvas>
+
+    <div class="hud">
+      <div class="cell"><b id="repCount">Rep 0</b><span>ángulo del muslo</span></div>
+      <div class="cell you"><b id="you">Tú —</b><span id="youLabel"></span></div>
+      <div class="cell tgt"><b id="targetText">Objetivo −10°</b><span id="targetLabel"></span></div>
+    </div>
+
+    <div id="banner" class="banner" hidden></div>
+
+    <div class="gauge" aria-hidden="true">
+      <div class="zone" id="gZone"></div>
+      <div class="mark parallel" id="gParallel"></div>
+      <div class="mark target" id="gTarget"></div>
+      <div class="mark min" id="gMin" hidden></div>
+      <div class="dot" id="gDot" hidden></div>
+    </div>
+
+    <div class="controls">
+      <button type="button" id="cMinus" class="ctl" aria-label="Objetivo más profundo">−</button>
+      <button type="button" id="cPlus" class="ctl" aria-label="Objetivo menos profundo">+</button>
+      <button type="button" id="cVoice" class="ctl" aria-label="Voz">
+        <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z" fill="currentColor"/><path class="waves" d="M16 8.5a5 5 0 0 1 0 7M18.5 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><path class="slash" d="M16 9l5 6M21 9l-5 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+      </button>
+      <button type="button" id="cCam" class="ctl" aria-label="Cambiar cámara">
+        <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M4 8h3l2-2h6l2 2h3v11H4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="M9.5 12.5a3 3 0 0 1 5-1.5m0 0V9m0 2h-2M14.5 14.5a3 3 0 0 1-5 1.5m0 0V18m0-2h2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+      <button type="button" id="cReset" class="ctl" aria-label="Reiniciar conteo">
+        <svg viewBox="0 0 24 24" width="24" height="24" aria-hidden="true"><path d="M5 12a7 7 0 1 0 2-5M5 4v4h4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button type="button" id="cStop" class="ctl stop">Terminar</button>
+    </div>
+    <div id="fps" class="fps"></div>
+  </main>
+
+  <!-- Resumen -->
+  <main id="summary" class="screen summary" hidden>
+    <h2 id="sumTitle">Resumen</h2>
+    <div class="stats" id="sumStats"></div>
+    <div class="table-wrap">
+      <table id="sumTable">
+        <thead><tr><th>Rep</th><th>Muslo</th><th>Resultado</th><th>Bajada</th><th>Subida</th><th>Torso</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <h3>Qué mejorar</h3>
+    <ul id="sumNotes" class="notes"></ul>
+    <div class="row">
+      <button type="button" id="again" class="btn primary">Otra serie</button>
+      <button type="button" id="share" class="btn">Compartir</button>
+      <button type="button" id="home" class="btn ghost">Inicio</button>
+    </div>
+  </main>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
