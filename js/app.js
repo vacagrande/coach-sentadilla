@@ -86,7 +86,7 @@ class Speaker {
     }
     try {
       this.audio ??= new (window.AudioContext || window.webkitAudioContext)();
-      this.audio.resume();
+      this.audio.resume().catch(() => {}); // rejected without a tap (tests); harmless
     } catch {
       this.audio = null;
     }
