@@ -1,6 +1,6 @@
 // Squat: thigh angle vs the floor, depth beep, spoken verdict per rep.
 // Port of src/squat_coach/live.py and metrics.py (same thresholds as the Mac version).
-import { JointFilter, deg, fmtDeg, innerAngle, mean, percentile } from './common.js';
+import { JointFilter, TimedWindow, deg, fmtDeg, innerAngle, mean, percentile } from './common.js';
 import { drawLegs } from './draw.js';
 
 export const DEPTH_TOL = 3; // degrees of slack when judging depth
@@ -9,11 +9,21 @@ const MIN_REP_S = 0.6;
 const UP_MAX = 65; // rep ends when thigh rises above min(UP_MAX, baseline - 12)
 const DOWN_DELTA = 20; // rep starts this far below the "up" threshold
 const BASELINE_DEFAULT = 80;
+const STAND_WINDOW_S = 5; // "standing" is learnt from the last seconds outside a rep...
+const STAND_MIN_S = 0.6; // ...once there is this much of it
 const FAST_DESCENT_S = 1.0;
 const INCONSISTENT_RANGE = 8;
 
 // COCO-17 keypoint indices (left, right) = subject's left / right
-const KP = { shoulder: [5, 6], hip: [11, 12], knee: [13, 14], ankle: [15, 16] };
+// lShoulder / rShoulder are both shoulders whatever the side: only used to notice the person is facing the camera.
+const KP = { shoulder: [5, 6], hip: [11, 12], knee: [13, 14], ankle: [15, 16], lShoulder: [5, 5], rShoulder: [6, 6] };
+const FACING_MAX = 0.6; // shoulder width / torso length: ~0.1 side-on, ~0.75 facing the camera
+
+function viewHint({ shoulder, hip, lShoulder, rShoulder }) {
+  const torso = Math.hypot(shoulder[0] - hip[0], shoulder[1] - hip[1]);
+  const facing = torso > 1 ? Math.abs(lShoulder[0] - rShoulder[0]) / torso : 0;
+  return facing > FACING_MAX ? 'Estás de frente: ponte de lado o elige la vista De frente' : null;
+}
 
 export function positionLabel(thigh) {
   if (thigh > 15) return 'sobre paralelo';
@@ -39,7 +49,7 @@ export function angles({ shoulder, hip, knee, ankle }) {
 export class RepCounter {
   constructor(target) {
     this.target = target;
-    this.standing = [];
+    this.standing = new TimedWindow(STAND_WINDOW_S); // thigh angles while not squatting
     this.reps = [];
     this.inRep = false;
     this.depthHit = false;
@@ -55,7 +65,7 @@ export class RepCounter {
   }
 
   thresholds() {
-    const base = this.standing.length >= 20 ? percentile(this.standing, 90) : BASELINE_DEFAULT;
+    const base = this.standing.covers(STAND_MIN_S) ? percentile(this.standing.values(), 90) : BASELINE_DEFAULT;
     const up = Math.min(UP_MAX, base - 12);
     return [up, up - DOWN_DELTA];
   }
@@ -66,8 +76,7 @@ export class RepCounter {
     const [up, down] = this.thresholds();
     const events = [];
     if (!this.inRep) {
-      this.standing.push(thigh);
-      if (this.standing.length > 150) this.standing.shift();
+      this.standing.push(t, thigh);
       if (thigh > up) {
         this.lastStandT = t;
       } else if (thigh < down) {
@@ -192,6 +201,7 @@ const VERDICT_LABEL = { objetivo: 'Objetivo', casi: 'Casi', corta: 'Corta' };
 /** Everything the app needs to coach a squat. */
 export const squat = {
   id: 'squat',
+  group: 'squat',
   name: 'Sentadilla',
   intro: 'Te mira de lado, mide tu muslo contra el paralelo y te dice en voz alta cómo fue cada repetición.',
   target: {
@@ -219,6 +229,7 @@ export const squat = {
   value: (xy) => angles(xy).thigh,
   positionLabel,
   draw: drawLegs,
+  viewHint,
   repFeedback,
   verdict: (rep, target) => depthVerdict(rep.bottomThigh, target),
   verdictLabel: VERDICT_LABEL,

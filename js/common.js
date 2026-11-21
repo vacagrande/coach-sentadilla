@@ -46,8 +46,10 @@ const LENGTH_MIN_SAMPLES = 15;
 
 /**
  * Online smoothing and sanity check of the joints one exercise needs, on the more visible body side.
- * cfg = { kp: {name: [leftIdx, rightIdx]}, sideJoints: [...], lengthPairs: [[a, b], ...], lengthTol }
- * A frame is dropped when any limb segment suddenly changes length (a joint was put in the wrong place).
+ * cfg = { kp: {name: [leftIdx, rightIdx]}, sideJoints: [...], lengthPairs: [[a, b], ...], lengthTol,
+ *         required?: [names], minScore?: number }
+ * A frame is dropped when any limb segment suddenly changes length (a joint was put in the wrong place),
+ * or when a `required` joint scores under `minScore` (the model is guessing where it is).
  */
 export class JointFilter {
   constructor(cfg) {
@@ -73,9 +75,10 @@ export class JointFilter {
     if (t === undefined) t = this.clock += DEFAULT_DT_S;
     if (!found) return this.miss(t);
     const { kps, scores } = found;
-    const { kp, sideJoints, lengthPairs, lengthTol } = this.cfg;
+    const { kp, sideJoints, lengthPairs, lengthTol, required, minScore = 0 } = this.cfg;
     const conf = [0, 1].map((side) => sideJoints.reduce((acc, n) => acc + scores[kp[n][side]], 0) / sideJoints.length);
     if (conf[1 - this.side] > conf[this.side] + SIDE_HYSTERESIS) this.side = 1 - this.side;
+    if (required?.some((n) => scores[kp[n][this.side]] < minScore)) return this.miss(t);
     const pts = {};
     for (const name of this.joints) {
       const i = kp[name][this.side];
@@ -105,6 +108,51 @@ export class JointFilter {
     this.seenT = t;
     return this.xy;
   }
+}
+
+/**
+ * The values pushed during the last `seconds` of observation. Used for "what does standing look like":
+ * counting seconds instead of samples keeps it the same on a phone doing 8 analyses per second and on
+ * one doing 60. Only time while values are being pushed counts (pauses, like a rep in progress, do not).
+ */
+export class TimedWindow {
+  constructor(seconds) {
+    this.seconds = seconds;
+    this.items = []; // [clock, value]
+    this.clock = 0;
+    this.lastT = null;
+  }
+
+  push(t, value) {
+    const dt = this.lastT === null ? DEFAULT_DT_S : Math.max(0, Math.min(0.25, t - this.lastT));
+    this.lastT = t;
+    this.clock += dt;
+    this.items.push([this.clock, value]);
+    while (this.items.length > 1 && this.clock - this.items[0][0] > this.seconds) this.items.shift();
+    if (this.items.length > 900) this.items.shift();
+  }
+
+  /** True once it holds at least `seconds` of data (and a handful of samples). */
+  covers(seconds) {
+    return this.items.length >= 6 && this.clock - this.items[0][0] >= seconds;
+  }
+
+  values() {
+    return this.items.map((item) => item[1]);
+  }
+}
+
+const ONE_KNEE_SLACK = 15; // % a single knee may fall behind the pair before it alone sets the score
+
+/**
+ * Knee score for the front view, from how far each knee sits inside its own ankle (fractions of the
+ * stance width; negative = outside). 100 = knees over the feet, more = further out, less = caving in.
+ * It is the knee separation as % of the foot separation, unless one knee alone is clearly worse.
+ */
+export function kneeScore(inL, inR) {
+  const pair = (1 - inL - inR) * 100;
+  const worstKnee = (1 - 2 * Math.max(inL, inR)) * 100 + ONE_KNEE_SLACK;
+  return Math.min(pair, worstKnee);
 }
 
 /** "en la rep 3" / "en las reps 2, 4 y 5". */

@@ -11,6 +11,8 @@ const OVERLAY_SETTLED_PX = 0.25; // stop repainting once the lines are this clos
 const STALL_MS = 2500; // camera delivering no frames for this long: restart it
 const BANNER_S = 4;
 const HIT_FLASH_S = 1;
+const WARN_FLASH_S = 1.5;
+const HINT_AFTER_S = 1.5; // a "wrong camera view" hint shows only after holding this long
 const SET_REST_S = 8; // this long without reps closes the set and speaks a summary
 const SLOW_FPS = 8;
 const HISTORY_MAX = 30;
@@ -109,17 +111,15 @@ class Speaker {
     }
   }
 
-  beep() {
+  /** Play short notes: [[frequency, start in seconds], ...]. */
+  tones(notes, type = 'sine') {
     if (!this.enabled || !this.audio) return;
     const ctx = this.audio;
     const t = ctx.currentTime;
-    for (const [freq, start] of [
-      [880, 0],
-      [1320, 0.11],
-    ]) {
+    for (const [freq, start] of notes) {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
-      osc.type = 'sine';
+      osc.type = type;
       osc.frequency.value = freq;
       gain.gain.setValueAtTime(0.0001, t + start);
       gain.gain.exponentialRampToValueAtTime(0.6, t + start + 0.015);
@@ -128,6 +128,25 @@ class Speaker {
       osc.start(t + start);
       osc.stop(t + start + 0.18);
     }
+  }
+
+  /** Rising pair: target reached. */
+  beep() {
+    this.tones([
+      [880, 0],
+      [1320, 0.11],
+    ]);
+  }
+
+  /** Falling low pair: fix something now (knees caving in). */
+  warn() {
+    this.tones(
+      [
+        [392, 0],
+        [294, 0.13],
+      ],
+      'triangle',
+    );
   }
 }
 
@@ -160,10 +179,16 @@ function setText(el, text) {
 }
 
 // ---------- setup screen ----------
+const groupOf = (ex) => ex.group || ex.id; // views of one exercise share a group (side / front squat)
+
 function renderSettings() {
   const ex = currentEx();
   for (const b of document.querySelectorAll('[data-exercise]')) {
-    b.setAttribute('aria-checked', String(b.dataset.exercise === ex.id));
+    b.setAttribute('aria-checked', String(b.dataset.exercise === groupOf(ex)));
+  }
+  $('viewRow').hidden = groupOf(ex) !== 'squat';
+  for (const b of document.querySelectorAll('[data-view]')) {
+    b.setAttribute('aria-checked', String(b.dataset.view === ex.id));
   }
   $('exIntro').textContent = ex.intro;
   $('tLabel').textContent = ex.target.label;
@@ -181,7 +206,8 @@ function renderSettings() {
 
 function changeTarget(delta) {
   const ex = live?.ex ?? currentEx();
-  settings.targets[ex.id] = Math.max(ex.target.min, Math.min(ex.target.max, targetFor(ex) + delta));
+  const next = targetFor(ex) + delta * (ex.target.step || 1);
+  settings.targets[ex.id] = Math.max(ex.target.min, Math.min(ex.target.max, next));
   saveSettings();
   renderSettings();
   if (live) live.counter.target = targetFor(ex);
@@ -189,7 +215,16 @@ function changeTarget(delta) {
 
 for (const b of document.querySelectorAll('[data-exercise]')) {
   b.onclick = () => {
-    settings.exercise = b.dataset.exercise;
+    // "Sentadilla" reopens whichever view (side / front) was used last
+    const id = b.dataset.exercise;
+    settings.exercise = id === 'squat' && EXERCISES[settings.squatView] ? settings.squatView : id;
+    saveSettings();
+    renderSettings();
+  };
+}
+for (const b of document.querySelectorAll('[data-view]')) {
+  b.onclick = () => {
+    settings.exercise = settings.squatView = b.dataset.view;
     saveSettings();
     renderSettings();
   };
@@ -528,8 +563,16 @@ async function processFrame(meta) {
   st.lastFrameAt = performance.now();
 
   const xy = st.filter.update(found, t);
-  const value = xy ? ex.value(xy) : null;
-  if (xy) for (const ev of st.counter.update(t, xy)) onEvent(st, ev, t);
+  if (xy) {
+    const frame = { w: video.videoWidth, h: video.videoHeight };
+    for (const ev of st.counter.update(t, xy, frame)) onEvent(st, ev, t);
+  }
+  const value = xy ? ex.value(xy, st.counter) : null; // null = nothing meaningful to show right now
+  // "wrong view" hint: only after it has held for a while, so one odd frame never shows it
+  const hint = xy && !st.counter.inRep ? ex.viewHint?.(xy) : null;
+  if (!hint) st.hintSince = null;
+  else st.hintSince ??= t;
+  st.hint = hint && t - st.hintSince >= HINT_AFTER_S ? hint : null;
   if (st.setReps.length && !st.counter.inRep && t - st.lastRepT > SET_REST_S) {
     const p = ex.setPhrase(st.setReps, target);
     speaker.say(p.spoken);
@@ -644,6 +687,11 @@ function onEvent(st, ev, t) {
     st.hitFlashUntil = t + HIT_FLASH_S;
     return;
   }
+  if (ev.kind === 'warn') {
+    speaker.warn();
+    st.banner = { text: ev.text, color: 'red', until: t + WARN_FLASH_S };
+    return;
+  }
   const fb = st.ex.repFeedback(ev.rep, targetFor(st.ex));
   speaker.say(fb.spoken);
   st.banner = { text: fb.text, color: fb.color, until: t + BANNER_S };
@@ -651,9 +699,10 @@ function onEvent(st, ev, t) {
   st.setReps.push(ev.rep);
 }
 
+/** Position on the side gauge. `top`/`bottom` are the values at each end; the good end is always the bottom. */
 function gaugeY(ex, v) {
   const { top, bottom } = ex.gauge;
-  const c = Math.max(bottom, Math.min(top, v));
+  const c = Math.max(Math.min(top, bottom), Math.min(Math.max(top, bottom), v));
   return `${((top - c) / (top - bottom)) * 100}%`;
 }
 
@@ -705,7 +754,7 @@ function renderHud(st, t, value, xy) {
   setText(el.repCount, `Rep ${st.counter.reps.length}`);
   setText(el.metricName, ex.metric);
   setText(el.you, value == null ? 'Tú —' : `Tú ${ex.fmt(value)}`);
-  setText(el.youLabel, value == null ? '' : ex.positionLabel(value, target));
+  setText(el.youLabel, !xy ? '' : value == null ? ex.idleLabel || '' : ex.positionLabel(value, target));
   setText(el.targetText, `Objetivo ${ex.fmt(target)}`);
   setText(el.targetLabel, ex.positionLabel(target, target));
 
@@ -713,13 +762,15 @@ function renderHud(st, t, value, xy) {
   if (t < st.hitFlashUntil) note = { text: ex.hit, color: 'green' };
   else if (st.banner && t < st.banner.until) note = st.banner;
   else if (!xy) note = { text: ex.lost, color: 'orange' };
+  else if (st.hint) note = { text: st.hint, color: 'orange' };
   setHidden(el.banner, !note);
   if (note) {
     setText(el.banner, note.text);
     if (el.banner.dataset.color !== note.color) el.banner.dataset.color = note.color;
   }
 
-  const zone = target + ex.tol;
+  // green zone = from the target (with its slack) to the good end of the gauge
+  const zone = ex.higherIsBetter ? target - ex.tol : target + ex.tol;
   setTop(el.gZone, gaugeY(ex, zone));
   setTop(el.gParallel, gaugeY(ex, ex.gauge.ref));
   setTop(el.gTarget, gaugeY(ex, target));
@@ -728,7 +779,7 @@ function renderHud(st, t, value, xy) {
   setHidden(el.gDot, value == null);
   if (value != null) {
     setTop(el.gDot, gaugeY(ex, value));
-    el.gDot.classList.toggle('hit', value <= zone);
+    el.gDot.classList.toggle('hit', ex.higherIsBetter ? value >= zone : value <= zone);
   }
 }
 

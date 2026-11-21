@@ -1,5 +1,7 @@
 // Overlays on the camera frame. Squat: green = your leg, red = target depth, blue dashed = knee height.
 // Curl: green = your arm, red = forearm at the target angle, blue dashed = torso line (keep the elbow on it).
+// Squat from the front: see drawFront.
+import { kneeScore } from './common.js';
 
 const GREEN = 'rgb(70, 230, 90)';
 const RED = 'rgb(235, 60, 75)';
@@ -53,6 +55,47 @@ export function drawLegs(ctx, xy, target, showTarget, s) {
   line(ctx, hip, knee, GREEN, t + 1);
   line(ctx, knee, ankle, GREEN, t + 1);
   for (const p of [hip, knee, ankle]) joint(ctx, p, GREEN, r, ring);
+}
+
+/**
+ * Squat from the front: both legs (green, or red when that knee caves in during the rep), a dashed blue
+ * line rising from each ankle (keep the knee on it or outside), and the hip and shoulder lines.
+ */
+export function drawFront(ctx, xy, target, active, s) {
+  const { lShoulder, rShoulder, lHip, rHip, lKnee, rKnee, lAnkle, rAnkle } = xy;
+  const t = Math.max(2, 5 * s);
+  const r = Math.max(4, 9 * s);
+  const ring = Math.max(1, 2 * s);
+  ctx.lineCap = 'round';
+  const stance = Math.abs(lAnkle[0] - rAnkle[0]) || 1;
+  const mid = (lAnkle[0] + rAnkle[0]) / 2;
+  const inside = (knee, ankle) => ((knee[0] - ankle[0]) * Math.sign(mid - ankle[0])) / stance;
+  const inL = inside(lKnee, lAnkle);
+  const inR = inside(rKnee, rAnkle);
+  const allowed = (1 - target / 100) / 2; // how far inside its ankle each knee may sit
+  const exL = inL - allowed;
+  const exR = inR - allowed;
+  const low = active && kneeScore(inL, inR) < target - 5;
+  const redL = low && (exL >= exR || exL > 0.03);
+  const redR = low && (exR > exL || exR > 0.03);
+  for (const [knee, ankle] of [
+    [lKnee, lAnkle],
+    [rKnee, rAnkle],
+  ]) {
+    const shank = Math.hypot(knee[0] - ankle[0], knee[1] - ankle[1]);
+    line(ctx, ankle, [ankle[0], knee[1] - shank * 0.35], BLUE, Math.max(1, t / 2), [10 * s, 10 * s]);
+  }
+  line(ctx, lShoulder, rShoulder, WHITE, Math.max(1, t / 2));
+  line(ctx, lHip, rHip, WHITE, Math.max(1, t / 2));
+  for (const [hip, knee, ankle, red] of [
+    [lHip, lKnee, lAnkle, redL],
+    [rHip, rKnee, rAnkle, redR],
+  ]) {
+    const color = red ? RED : GREEN;
+    line(ctx, hip, knee, color, t + 1);
+    line(ctx, knee, ankle, color, t + 1);
+    for (const p of [hip, knee, ankle]) joint(ctx, p, color, r, ring);
+  }
 }
 
 /** Where the wrist would be with the same forearm length at the target elbow angle (same side as now). */
